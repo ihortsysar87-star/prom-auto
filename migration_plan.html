@@ -1,0 +1,489 @@
+<title>Igor Bot — n8n → Python Migration Plan</title>
+<style>
+  :root {
+    --paper: #f2f0ea;
+    --ink: #14181a;
+    --line: #dcd8cc;
+    --accent: #1f8a70;
+    --accent-warn: #c8762a;
+    --muted: #6f6d63;
+    --card: #ffffff;
+    --font-display: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    --font-body: -apple-system, "Segoe UI", system-ui, sans-serif;
+    --font-mono: "Cascadia Code", "JetBrains Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0e1210;
+      --ink: #eae7de;
+      --line: rgba(234, 231, 222, 0.14);
+      --accent: #3ecb9e;
+      --accent-warn: #e2984c;
+      --muted: #9a978c;
+      --card: #171b19;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #0e1210;
+    --ink: #eae7de;
+    --line: rgba(234, 231, 222, 0.14);
+    --accent: #3ecb9e;
+    --accent-warn: #e2984c;
+    --muted: #9a978c;
+    --card: #171b19;
+  }
+  :root[data-theme="light"] {
+    --paper: #f2f0ea;
+    --ink: #14181a;
+    --line: #dcd8cc;
+    --accent: #1f8a70;
+    --accent-warn: #c8762a;
+    --muted: #6f6d63;
+    --card: #ffffff;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+    line-height: 1.55;
+  }
+  .wrap {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 4rem 1.5rem 6rem;
+  }
+
+  header.doc-header {
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 2rem;
+    margin-bottom: 3rem;
+  }
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  h1 {
+    font-family: var(--font-display);
+    font-size: clamp(1.8rem, 4vw, 2.6rem);
+    font-weight: 400;
+    margin: 0.4rem 0 0.6rem;
+    text-wrap: balance;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 1.02rem;
+    max-width: 62ch;
+  }
+  .meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.5rem;
+    margin-top: 1.4rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--muted);
+  }
+  .meta-row b { color: var(--ink); font-weight: 600; }
+
+  /* spine layout */
+  .spine {
+    position: relative;
+    padding-left: 1.6rem;
+    border-left: 1px solid var(--line);
+  }
+  section.step {
+    position: relative;
+    margin-bottom: 3.2rem;
+  }
+  section.step::before {
+    content: "";
+    position: absolute;
+    left: -1.68rem;
+    top: 0.35rem;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--paper);
+  }
+  h2 {
+    font-family: var(--font-display);
+    font-size: 1.4rem;
+    font-weight: 400;
+    margin: 0 0 0.9rem;
+  }
+  h3 {
+    font-family: var(--font-body);
+    font-size: 0.95rem;
+    font-weight: 700;
+    margin: 1.6rem 0 0.6rem;
+  }
+  p { max-width: 68ch; }
+  .muted { color: var(--muted); }
+
+  code, .mono { font-family: var(--font-mono); font-size: 0.86em; }
+  code {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 0.1em 0.4em;
+  }
+
+  /* flow diagram */
+  .flow {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+    margin: 1.2rem 0;
+    overflow-x: auto;
+    padding-bottom: 0.4rem;
+  }
+  .flow-node {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 0.5rem 0.7rem;
+    white-space: nowrap;
+  }
+  .flow-node.dead {
+    color: var(--muted);
+    border-style: dashed;
+    text-decoration: line-through;
+    text-decoration-color: var(--muted);
+  }
+  .flow-arrow { color: var(--accent); font-size: 0.9rem; flex: none; }
+  .flow-branch {
+    flex-basis: 100%;
+    height: 0;
+  }
+
+  /* mapping table */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0 1.6rem;
+    font-size: 0.88rem;
+  }
+  caption { text-align: left; font-size: 0.78rem; color: var(--muted); margin-bottom: 0.5rem; }
+  th, td {
+    text-align: left;
+    padding: 0.55rem 0.7rem;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  th {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  td.node { font-family: var(--font-mono); color: var(--muted); }
+  td.py code { color: var(--accent); border-color: transparent; background: transparent; padding: 0; }
+  .table-scroll { overflow-x: auto; }
+
+  /* file tree */
+  .tree {
+    font-family: var(--font-mono);
+    font-size: 0.84rem;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 1rem 1.2rem;
+    white-space: pre;
+    overflow-x: auto;
+  }
+  .tree .done { color: var(--accent); }
+  .tree .todo { color: var(--accent-warn); }
+
+  /* checklist */
+  ol.checklist { list-style: none; margin: 0; padding: 0; counter-reset: phase; }
+  ol.checklist li {
+    counter-increment: phase;
+    display: flex;
+    gap: 0.9rem;
+    padding: 0.85rem 0;
+    border-bottom: 1px solid var(--line);
+  }
+  ol.checklist li:last-child { border-bottom: none; }
+  ol.checklist li::before {
+    content: counter(phase, decimal-leading-zero);
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--accent);
+    flex: none;
+    padding-top: 0.15rem;
+  }
+  ol.checklist .status {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    padding: 0.15rem 0.45rem;
+    border-radius: 3px;
+    flex: none;
+    height: fit-content;
+  }
+  .status.done { color: var(--accent); border: 1px solid var(--accent); }
+  .status.next { color: var(--accent-warn); border: 1px solid var(--accent-warn); }
+  .status.later { color: var(--muted); border: 1px solid var(--line); }
+
+  /* callout */
+  .callout {
+    border: 1px solid var(--accent-warn);
+    border-radius: 8px;
+    padding: 1rem 1.2rem;
+    background: color-mix(in srgb, var(--accent-warn) 8%, var(--card));
+    margin: 1rem 0;
+  }
+  .callout .eyebrow { color: var(--accent-warn); }
+
+  ul.qa { padding-left: 1.1rem; }
+  ul.qa li { margin-bottom: 0.7rem; }
+
+  @media (prefers-reduced-motion: no-preference) {
+    section.step { transition: opacity 0.2s ease; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="doc-header">
+    <div class="eyebrow">Migration Plan · prom-auto</div>
+    <h1>From n8n canvas to a Python package</h1>
+    <p class="subtitle">
+      Analysis of the "Igor bot" n8n workflow (id <code>hj7eqLeZ1W6MEy4V</code>) and the
+      plan for reproducing it as a plain Python codebase living in this repo.
+    </p>
+    <div class="meta-row">
+      <span><b>Source</b> n8n workflow "Igor bot"</span>
+      <span><b>Target</b> <code>prom_auto/</code> package</span>
+      <span><b>Status</b> Job A scaffolded; Job B out of scope for now</span>
+      <span><b>Date</b> 2026-07-18</span>
+    </div>
+  </header>
+
+  <div class="spine">
+
+    <section class="step">
+      <h2>1. What the n8n workflow actually does</h2>
+      <p>
+        One Telegram bot, two independent jobs sharing it. The first is the live
+        product-listing pipeline, triggered by a photo message. The second is a
+        bulk Prom.ua → MySQL sync that has <strong>no trigger node</strong> in the
+        export — it was run by hand from the n8n editor, not on any schedule.
+      </p>
+
+      <h3>Job A — photo → Prom.ua listing (active path)</h3>
+      <div class="flow">
+        <span class="flow-node">Telegram Trigger</span><span class="flow-arrow">→</span>
+        <span class="flow-node">Get a file</span><span class="flow-arrow">→</span>
+        <span class="flow-node">HTTP Request api.telegram</span><span class="flow-arrow">→</span>
+        <span class="flow-node">Extract from File</span><span class="flow-arrow">→</span>
+        <span class="flow-node">Aggregate</span><span class="flow-arrow">→</span>
+        <span class="flow-node">Parse raw data2</span><span class="flow-arrow">→</span>
+        <span class="flow-node">HTTP Request api.openai</span>
+        <div class="flow-branch"></div>
+        <span class="flow-arrow">→</span>
+        <span class="flow-node">Merge</span><span class="flow-arrow">→</span>
+        <span class="flow-node">parse to prom api</span><span class="flow-arrow">→</span>
+        <span class="flow-node">Convert to File</span><span class="flow-arrow">→</span>
+        <span class="flow-node">HTTP Request to prom</span><span class="flow-arrow">→</span>
+        <span class="flow-node">Send a text message1</span>
+      </div>
+      <p class="muted">
+        Three nodes — <span class="mono">Parse raw data</span>,
+        <span class="mono">Send a text message</span>,
+        <span class="mono">Edit Fields</span> — sit in the canvas fully
+        disconnected from the trigger. They read like an earlier draft of the
+        reply-formatting step, superseded by <span class="mono">parse to prom
+        api</span>. Not being carried into the Python port unless you tell me
+        otherwise.
+      </p>
+      <div class="flow">
+        <span class="flow-node dead">Parse raw data</span><span class="flow-arrow">→</span>
+        <span class="flow-node dead">Send a text message</span>
+        <span class="flow-node dead" style="margin-left:1.2rem">Edit Fields</span>
+        <span class="muted mono" style="margin-left:0.6rem;font-size:0.72rem">unreachable from trigger</span>
+      </div>
+
+      <h3>Job B — bulk Prom.ua → MySQL sync (manual, no trigger)</h3>
+      <div class="callout">
+        <div class="eyebrow">Out of scope for now</div>
+        <p style="margin:0.5rem 0 0">
+          Documented here for completeness, but not being ported in this
+          pass — no <span class="mono">db.py</span> / <span class="mono">sync_products.py</span>
+          in the current scaffold.
+        </p>
+      </div>
+      <div class="flow">
+        <span class="flow-node dead">HTTP Prom 1-100</span>
+        <span class="flow-node dead">HTTP Prom 101-200</span>
+        <span class="flow-node dead">HTTP Prom 201-300</span>
+        <span class="flow-node dead">HTTP Prom 301-400</span>
+        <div class="flow-branch"></div>
+        <span class="flow-arrow">↘ all four →</span>
+        <span class="flow-node dead">Parse raw data1</span><span class="flow-arrow">→</span>
+        <span class="flow-node dead">Insert or update rows in a table</span>
+      </div>
+      <p class="muted">
+        The four HTTP nodes hardcode their <span class="mono">last_id</span>
+        page cursors rather than looping — a static, one-time snapshot of
+        ~400 products rather than a real paginator. If this ever comes into
+        scope, it's worth rewriting as a proper <span class="mono">while</span>
+        loop over <span class="mono">last_id</span> rather than porting the
+        four fixed calls as-is.
+      </p>
+    </section>
+
+    <section class="step">
+      <h2>2. Node → Python mapping</h2>
+      <div class="table-scroll">
+      <table>
+        <caption>Every reachable node and where its logic now lives</caption>
+        <thead>
+          <tr><th>n8n node</th><th>Python location</th><th>Note</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="node">Telegram Trigger</td><td class="py"><code>telegram_bot.py</code> · <code>MessageHandler(filters.PHOTO)</code></td><td>python-telegram-bot's polling loop replaces the webhook trigger</td></tr>
+          <tr><td class="node">Get a file</td><td class="py"><code>telegram_bot.handle_photo</code></td><td><code>photo.get_file()</code></td></tr>
+          <tr><td class="node">HTTP Request api.telegram</td><td class="py"><code>telegram_bot.handle_photo</code></td><td>collapsed into <code>download_as_bytearray()</code> — no manual URL needed</td></tr>
+          <tr><td class="node">Extract from File / Aggregate</td><td class="py"><code>telegram_bot.handle_photo</code></td><td>builds the image-bytes list directly; ready to extend to photo albums</td></tr>
+          <tr><td class="node">Parse raw data2</td><td class="py"><code>openai_client.py</code></td><td>prompt template ported verbatim (Ukrainian instructions preserved)</td></tr>
+          <tr><td class="node">HTTP Request api.openai</td><td class="py"><code>openai_client.identify_product()</code></td><td>uses the official <code>openai</code> SDK's Responses API</td></tr>
+          <tr><td class="node">Merge</td><td class="py"><code>telegram_bot.handle_photo</code></td><td>plain sequential calls — no merge step needed outside n8n's graph model</td></tr>
+          <tr><td class="node">parse to prom api</td><td class="py"><code>product_mapper.build_prom_product()</code></td><td>same Ukrainian column names Prom.ua expects</td></tr>
+          <tr><td class="node">Convert to File</td><td class="py"><code>xlsx_builder.build_xlsx()</code></td><td><code>openpyxl</code> instead of n8n's binary conversion node</td></tr>
+          <tr><td class="node">HTTP Request to prom</td><td class="py"><code>prom_client.import_file()</code></td><td>original had 5 retries / 5s backoff — not yet ported, see §4</td></tr>
+          <tr><td class="node">Send a text message1</td><td class="py"><code>telegram_bot.handle_photo</code></td><td><code>update.message.reply_text()</code></td></tr>
+          <tr><td class="node">HTTP Prom 1-100 … 301-400</td><td class="py muted">— not ported —</td><td>Job B, out of scope for now</td></tr>
+          <tr><td class="node">Parse raw data1</td><td class="py muted">— not ported —</td><td>Job B, out of scope for now</td></tr>
+          <tr><td class="node">Insert or update rows in a table</td><td class="py muted">— not ported —</td><td>Job B, out of scope for now</td></tr>
+        </tbody>
+      </table>
+      </div>
+    </section>
+
+    <section class="step">
+      <h2>3. New project layout</h2>
+      <p>Already created in this repo. The earlier <code>telegram_image_bot.py</code> prototype has been removed now that <code>prom_auto/telegram_bot.py</code> supersedes it:</p>
+      <div class="tree">prom-auto/
+├── prom_auto/
+│   ├── <span class="done">config.py</span>          <span class="muted"># env-based settings, loads .env</span>
+│   ├── <span class="done">telegram_bot.py</span>     <span class="muted"># entry point — photo handler, orchestrates the pipeline</span>
+│   ├── <span class="done">openai_client.py</span>    <span class="muted"># product identification via Responses API</span>
+│   ├── <span class="done">product_mapper.py</span>   <span class="muted"># OpenAI JSON -> Prom.ua import columns</span>
+│   ├── <span class="done">xlsx_builder.py</span>     <span class="muted"># builds the Prom.ua import file</span>
+│   └── <span class="done">prom_client.py</span>      <span class="muted"># Prom.ua API: import_file</span>
+├── <span class="done">requirements.txt</span>
+├── <span class="done">.env.example</span>
+├── <span class="done">.gitignore</span>
+├── <span class="done">README.md</span>
+└── migration_plan.html    <span class="muted"># this document</span>
+
+<span class="muted">  db.py / sync_products.py (Job B) — deferred, out of scope for now</span></div>
+    </section>
+
+    <section class="step">
+      <h2>4. Secrets — do not carry these over as-is</h2>
+      <div class="callout">
+        <div class="eyebrow">Carried over from the n8n export</div>
+        <p style="margin:0.5rem 0 0">
+          The workflow JSON had three live credentials hardcoded directly in
+          node parameters: a Prom.ua bearer token, an OpenAI key, and the
+          Telegram bot token embedded in plain HTTP URLs. All three are now
+          read from environment variables via <code>prom_auto/config.py</code>
+          and <code>.env</code> (git-ignored) — but the <em>old</em> values
+          are still valid until you rotate them.
+        </p>
+      </div>
+      <p>
+        Before switching real traffic to the Python bot: rotate the Prom.ua
+        API token, the OpenAI key, and the Telegram bot token, then put only
+        the new values in <code>.env</code>.
+      </p>
+    </section>
+
+    <section class="step">
+      <h2>5. Open questions</h2>
+      <ul class="qa">
+        <li>
+          <b>Model — resolved.</b> <span class="mono">gpt-5.4</span> from the
+          n8n export turned out to be a real, current OpenAI model, not a
+          typo. After comparing cost and capability across
+          <span class="mono">gpt-4o-mini</span>, <span class="mono">gpt-5.4</span>,
+          <span class="mono">gpt-5.4-mini</span>, and <span class="mono">gpt-5.4-nano</span>,
+          <span class="mono">config.py</span> now defaults to
+          <span class="mono">gpt-5.4-mini</span> — full vision + web-search
+          tool support at a fraction of the full model's cost, on a
+          generation OpenAI isn't sunsetting (unlike <span class="mono">gpt-4o-mini</span>).
+        </li>
+        <li>
+          <b>Image hosting — resolved.</b> The n8n flow pointed Prom.ua's
+          <span class="mono">Посилання_зображення</span> field at a Telegram
+          <span class="mono">api.telegram.org/file/bot&lt;token&gt;/…</span>
+          URL, which expires and leaks the bot token to anyone who views the
+          listing's image source. Instead of re-hosting the user's own photo,
+          <span class="mono">openai_client.py</span> now asks the
+          <span class="mono">web_search</span> tool for image results
+          (<span class="mono">search_content_types: ["image", "text"]</span>)
+          alongside the text answer, and <span class="mono">telegram_bot.py</span>
+          uses the first result that resolves to a real image (HEAD-checked)
+          as the listing photo — a proper product photo instead of a
+          customer snapshot. Falls back to the Telegram photo only if search
+          comes up empty.
+        </li>
+        <li>
+          <b>Job B, if it comes back into scope.</b> It had no trigger node
+          at all in the export, and the target MySQL <span class="mono">products</span>
+          table's schema isn't in the workflow export either — both would
+          need answers before porting it.
+        </li>
+        <li>
+          <b>Retry behavior.</b> The n8n upload node retried up to 5 times
+          with a 5s wait; <span class="mono">prom_client.import_file()</span>
+          doesn't retry yet. Add it if Prom.ua's endpoint is flaky in
+          practice.
+        </li>
+      </ul>
+    </section>
+
+    <section class="step">
+      <h2>6. Rollout checklist</h2>
+      <ol class="checklist">
+        <li>
+          <span class="status done">done</span>
+          <div><b>Scaffold the package.</b> Folder structure, config loader, and a first-pass
+          implementation of every module in the mapping table above.</div>
+        </li>
+        <li>
+          <span class="status next">next</span>
+          <div><b>Resolve the open questions.</b> Model name, image hosting, MySQL schema — confirm
+          before wiring this into anything live.</div>
+        </li>
+        <li>
+          <span class="status next">next</span>
+          <div><b>Dry-run Job A.</b> Send a real product photo through <code>telegram_bot.py</code>
+          against a Prom.ua staging catalog if one exists; compare the resulting listing to what
+          the n8n flow used to produce.</div>
+        </li>
+        <li>
+          <span class="status later">later</span>
+          <div><b>Cut over.</b> Rotate all three secrets, deactivate the n8n workflow, and run
+          the Python bot as the long-lived process (systemd / Task Scheduler / similar).</div>
+        </li>
+      </ol>
+    </section>
+
+  </div>
+</div>
