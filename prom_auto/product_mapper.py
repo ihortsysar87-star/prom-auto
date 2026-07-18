@@ -1,5 +1,7 @@
 import random
 
+from . import config
+
 
 def build_prom_product(data: dict, image_url: str) -> dict:
     """Equivalent of the n8n 'parse to prom api' Code node.
@@ -15,6 +17,8 @@ def build_prom_product(data: dict, image_url: str) -> dict:
     all_keywords = ", ".join(keywords) if isinstance(keywords, list) else ""
 
     specs = [
+        ("Бренд", data.get("brand")),
+        ("Модель", data.get("model")),
         ("Матеріал", data.get("material")),
         ("Колір", data.get("color")),
         ("Ширина", data.get("width")),
@@ -41,14 +45,12 @@ def build_prom_product(data: dict, image_url: str) -> dict:
         "Посилання_зображення": image_url,
         "Валюта": "UAH",
         "Одиниця_виміру": "шт",
-        "Бренд": data.get("brand", ""),
         "Виробник": data.get("manufacturer", ""),
         "Країна_виробник": data.get("country", ""),
-        "Матеріал": data.get("material", ""),
         "Ширина,см": data.get("width", ""),
         "Висота,см": data.get("height", ""),
         "Довжина,см": data.get("length", ""),
         "Вага,кг": data.get("weight", ""),
-        "Модель": data.get("model", ""),
+        "Де_знаходиться_товар": config.PROM_REGION,
         "Пошукові_запити_укр": all_keywords,
     }

@@ -429,19 +429,49 @@
           generation OpenAI isn't sunsetting (unlike <span class="mono">gpt-4o-mini</span>).
         </li>
         <li>
-          <b>Image hosting — resolved.</b> The n8n flow pointed Prom.ua's
-          <span class="mono">Посилання_зображення</span> field at a Telegram
-          <span class="mono">api.telegram.org/file/bot&lt;token&gt;/…</span>
+          <b>Image hosting — tried web search, settled on Telegram photos.</b>
+          The n8n flow pointed Prom.ua's <span class="mono">Посилання_зображення</span>
+          field at a Telegram <span class="mono">api.telegram.org/file/bot&lt;token&gt;/…</span>
           URL, which expires and leaks the bot token to anyone who views the
-          listing's image source. Instead of re-hosting the user's own photo,
-          <span class="mono">openai_client.py</span> now asks the
-          <span class="mono">web_search</span> tool for image results
-          (<span class="mono">search_content_types: ["image", "text"]</span>)
-          alongside the text answer, and <span class="mono">telegram_bot.py</span>
-          uses the first result that resolves to a real image (HEAD-checked)
-          as the listing photo — a proper product photo instead of a
-          customer snapshot. Falls back to the Telegram photo only if search
-          comes up empty.
+          listing's image source. We tried replacing it with a real product
+          photo from the <span class="mono">web_search</span> tool's image
+          results (<span class="mono">search_content_types: ["image", "text"]</span>,
+          even forcing the tool with <span class="mono">tool_choice: "required"</span>),
+          but across every live test <span class="mono">gpt-5.4-mini</span>
+          only ever returned <span class="mono">text_result</span> entries —
+          never <span class="mono">image_result</span> — so the feature was
+          dropped. <span class="mono">telegram_bot.py</span> now just uses the
+          user's own Telegram photo(s) directly (still the same expiring-URL
+          tradeoff as the original n8n flow, just no longer masked by an
+          image-search feature that wasn't actually working).
+        </li>
+        <li>
+          <b>Multiple photos per listing — added.</b> Telegram sends an album
+          as several separate updates sharing one <span class="mono">media_group_id</span>.
+          <span class="mono">telegram_bot.py</span> now buffers those for
+          ~1.5s after the last one arrives, then processes the whole album as
+          a single product: all photos go to <span class="mono">openai_client.identify_product()</span>
+          for identification, and all of them are joined with <span class="mono">;</span>
+          into Prom.ua's <span class="mono">Посилання_зображення</span> field
+          (its documented separator for multiple images). A single photo with
+          no album still works exactly as before.
+        </li>
+        <li>
+          <b>Prom.ua import headers — fixed.</b> The first live test failed
+          with <span class="mono">Невідомі заголовки: 'Бренд', 'Матеріал', 'Модель'</span> —
+          those three aren't valid columns for this Prom.ua account's import
+          template (Prom.ua ignores/rejects any header not in its own
+          documented list, custom characteristics aren't just free-form
+          column names). <span class="mono">product_mapper.py</span> now
+          folds brand/model/material into the description text instead of
+          sending them as standalone columns.
+        </li>
+        <li>
+          <b>Region — added.</b> Prom.ua's XLS import field for the item's
+          location is <span class="mono">Де_знаходиться_товар</span> (not a
+          "region" column), taking a locality name. Added as
+          <span class="mono">config.PROM_REGION</span> (default
+          <span class="mono">Київ</span>) and wired into every listing.
         </li>
         <li>
           <b>Job B, if it comes back into scope.</b> It had no trigger node
@@ -467,20 +497,22 @@
           implementation of every module in the mapping table above.</div>
         </li>
         <li>
-          <span class="status next">next</span>
-          <div><b>Resolve the open questions.</b> Model name, image hosting, MySQL schema — confirm
-          before wiring this into anything live.</div>
+          <span class="status done">done</span>
+          <div><b>Resolve the open questions.</b> Model chosen (gpt-5.4-mini), secrets rotated,
+          image-hosting approach settled (Telegram photos), Prom.ua headers and region field fixed
+          against real import errors.</div>
         </li>
         <li>
-          <span class="status next">next</span>
-          <div><b>Dry-run Job A.</b> Send a real product photo through <code>telegram_bot.py</code>
-          against a Prom.ua staging catalog if one exists; compare the resulting listing to what
-          the n8n flow used to produce.</div>
+          <span class="status done">done</span>
+          <div><b>Dry-run Job A.</b> Multiple real photos (single and multi-photo albums) sent
+          through <code>telegram_bot.py</code> against the live Prom.ua catalog — listings created
+          successfully each time.</div>
         </li>
         <li>
           <span class="status later">later</span>
-          <div><b>Cut over.</b> Rotate all three secrets, deactivate the n8n workflow, and run
-          the Python bot as the long-lived process (systemd / Task Scheduler / similar).</div>
+          <div><b>Cut over.</b> Deactivate the n8n workflow (already inactive) and run the Python
+          bot as the long-lived process (systemd / Task Scheduler / similar) instead of an ad-hoc
+          foreground session.</div>
         </li>
       </ol>
     </section>
