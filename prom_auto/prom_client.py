@@ -33,7 +33,12 @@ def import_file(xlsx_bytes: bytes) -> dict:
         if response.ok:
             return response.json()
 
-        if _CONCURRENT_IMPORT_MARKER in response.text:
+        try:
+            error_message = response.json().get("error", {}).get("message", "")
+        except ValueError:
+            error_message = response.text
+
+        if _CONCURRENT_IMPORT_MARKER in error_message:
             if attempt < _MAX_TRIES:
                 logger.warning(
                     "Prom.ua busy with a previous import, retrying (%d/%d)", attempt, _MAX_TRIES
@@ -45,5 +50,5 @@ def import_file(xlsx_bytes: bytes) -> dict:
                 "known nightly restriction rather than a quick transient lock."
             )
 
-        logger.error("Prom.ua import_file error response: %s", response.text)
+        logger.error("Prom.ua import_file error response: %s", error_message)
         response.raise_for_status()
