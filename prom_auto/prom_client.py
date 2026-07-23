@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 
 import requests
@@ -17,6 +18,75 @@ _CONCURRENT_IMPORT_MARKER = "одновременных импорт"
 class PromImportBusyError(Exception):
     """Prom.ua is refusing new imports - either a normal transient lock, or
     their known nightly restriction, which can outlast a short retry."""
+
+
+def count_products() -> int:
+    """Total number of products currently in the Prom.ua account.
+
+    Prom.ua's API has no dedicated count endpoint, so this pages through
+    GET /products/list (sorted by id) and sums how many come back, using
+    each page's lowest id as the next page's upper bound.
+    """
+    total = 0
+    last_id = None
+    page_size = 100
+    while True:
+        params = {"limit": page_size}
+        if last_id is not None:
+            params["last_id"] = last_id
+        response = requests.get(
+            f"{config.PROM_API_BASE_URL}/products/list",
+            headers=_HEADERS,
+            params=params,
+            timeout=30,
+        )
+        response.raise_for_status()
+        products = response.json().get("products", [])
+        if not products:
+            break
+        total += len(products)
+        if len(products) < page_size:
+            break
+        last_id = min(p["id"] for p in products) - 1
+    return total
+
+
+_ARTICLE_PATTERN = re.compile(r"^v(\d+)$", re.IGNORECASE)
+
+
+def find_max_article_number() -> int:
+    """Scans existing products for 'vNNNN'-style external_id/sku and returns
+    the highest N found. Used to seed article_counter's local counter, since
+    count_products() alone isn't safe here: Prom.ua's import is async, so a
+    just-submitted product's article might already be higher than the
+    current live count reflects.
+    """
+    max_number = 0
+    last_id = None
+    page_size = 100
+    while True:
+        params = {"limit": page_size}
+        if last_id is not None:
+            params["last_id"] = last_id
+        response = requests.get(
+            f"{config.PROM_API_BASE_URL}/products/list",
+            headers=_HEADERS,
+            params=params,
+            timeout=30,
+        )
+        response.raise_for_status()
+        products = response.json().get("products", [])
+        if not products:
+            break
+        for product in products:
+            for value in (product.get("external_id"), product.get("sku")):
+                match = _ARTICLE_PATTERN.match(str(value or ""))
+                if match:
+                    max_number = max(max_number, int(match.group(1)))
+        if len(products) < page_size:
+            break
+        last_id = min(p["id"] for p in products) - 1
+    return max_number
 
 
 def import_file(xlsx_bytes: bytes) -> dict:

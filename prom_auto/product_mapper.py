@@ -1,6 +1,4 @@
-import random
-
-from . import config
+from . import article_counter, config
 
 
 def build_prom_product(data: dict, image_url: str) -> dict:
@@ -12,7 +10,7 @@ def build_prom_product(data: dict, image_url: str) -> dict:
     if data.get("error"):
         raise ValueError("Товар не знайдено")
 
-    sku = random.randint(1000, 9999)
+    article = article_counter.next_article()
     keywords = data.get("keywords") or []
     all_keywords = ", ".join(keywords) if isinstance(keywords, list) else ""
 
@@ -31,11 +29,15 @@ def build_prom_product(data: dict, image_url: str) -> dict:
     )
 
     description = f"{data.get('description', '')}\n\nХарактеристики:\n{specifications}"
-    name = f"{data.get('name', '')} {data.get('brand', '')}".strip()
+    name = " ".join(part for part in (data.get("name"), data.get("brand")) if part).strip()
 
     return {
-        "Унікальний_ідентифікатор": sku,
-        "Код_товару": f"v{sku}",
+        "Ідентифікатор_товару": article,
+        "Код_товару": article,
+        # Prom.ua requires non-empty text in "Назва_позиції" (its Russian-
+        # language field) or it silently drops the whole row on import - we
+        # only have Ukrainian text, so it's duplicated here rather than left
+        # blank.
         "Назва_позиції": name,
         "Назва_позиції_укр": name,
         "Опис_укр": description,
