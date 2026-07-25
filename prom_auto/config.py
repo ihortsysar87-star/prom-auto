@@ -14,8 +14,6 @@ PROM_REGION = os.environ.get("PROM_REGION", "Київ")
 
 IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY", "")
 
-GOOGLE_VISION_API_KEY = os.environ.get("GOOGLE_VISION_API_KEY", "")
-
 # Chat ID of the separate Telegram group products also get posted to, with a
 # manually-set price (unlike Prom.ua, which gets an AI-estimated price).
 # Negative for groups/supergroups. Get it by adding the bot to the group as

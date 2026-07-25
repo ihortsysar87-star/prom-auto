@@ -1,16 +1,16 @@
 import logging
 
-from telegram import Update
+from telegram import InputMediaPhoto, Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from . import (
     config,
     image_host,
     openai_client,
+    page_fetch,
     product_image_scraper,
     prom_client,
     product_mapper,
-    reverse_image_search,
     xlsx_builder,
 )
 
@@ -19,18 +19,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Every photo sent is treated as its own separate product (even ones sent
-# together as one Telegram album) - this is how many products a single
-# message can identify at once. Waits this long after the last photo before
-# assuming the user is done sending and starts processing the whole batch.
-BATCH_FLUSH_DELAY = 8.0
+# Photos sharing a Telegram media_group_id (sent together as one album) are
+# treated as multiple photos of the SAME product; a photo sent on its own is
+# its own product. Telegram delivers each album photo as a separate update,
+# so this is how long to wait after the last photo of a group before
+# deciding the group is complete and asking whether to add another product.
+ALBUM_COLLECT_DELAY = 2.5
 
+# chat_id -> {
+#   "groups": list[list[bytes]],           completed product photo-groups,
+#                                           queued for _process_batch
+#   "current_group": list[bytes] | None,   photos being collected for the
+#                                           in-progress group
+#   "current_media_group_id": str | None,  media_group_id of the in-progress
+#                                           group, if any
+#   "job": Job | None,                     debounce job that finalizes
+#                                           current_group
+#   "awaiting_continue": bool,             True once we've asked "add
+#                                           another product?"
+# }
 _pending_batches: dict[int, dict] = {}
 
-# chat_id -> {"queue": list[tuple[bytes, dict]], "awaiting": bool}. Drives the
+# chat_id -> {"queue": list[tuple[list[bytes], dict]], "awaiting": bool}. Drives the
 # post-batch "what price for the sales group?" back-and-forth: one entry per
 # successfully identified product, asked one at a time.
 _pending_price_requests: dict[int, dict] = {}
+
+# Ukrainian/English yes-no answers, used both for "add another product?" and
+# for the per-product sales-group prompt.
+_YES_ANSWERS = {"так", "да", "yes", "y"}
+_NO_ANSWERS = {"ні", "ни", "нет", "no", "n"}
 
 _FIELD_LABELS = {
     "name": "назва",
@@ -65,7 +83,7 @@ def _format_data_sources(data_sources: dict, source_urls: dict | None = None) ->
     return "ℹ️ Джерела даних — " + "; ".join(parts) if parts else ""
 
 
-def _identify_and_validate(photos: list[bytes], image_search_hints: dict | None) -> tuple[dict, int]:
+def _identify_and_validate(photos: list[bytes]) -> tuple[dict, int]:
     """Runs identify_product once and enforces that any "web" data_source
     claim is backed by a real URL, downgrading it to "estimated" otherwise -
     a "web" self-report is only as trustworthy as the source_urls/
@@ -73,7 +91,7 @@ def _identify_and_validate(photos: list[bytes], image_search_hints: dict | None)
 
     Returns (data, search_count).
     """
-    response, search_count = openai_client.identify_product(photos, image_search_hints=image_search_hints)
+    response, search_count = openai_client.identify_product(photos)
     data = openai_client.extract_json(response)
     logger.info("Full identification data (%d web search(es)): %s", search_count, data)
 
@@ -87,40 +105,78 @@ def _identify_and_validate(photos: list[bytes], image_search_hints: dict | None)
         logger.warning("price_found=True with no price_source_url - downgrading")
         data["price_found"] = False
 
+    # A real URL isn't proof the page is actually about THIS product -
+    # confirmed empirically (two "web"-confirmed citations in a row were
+    # both for the wrong item). Cheap sanity check: the brand/model anchor
+    # must actually appear in the cited page's real text, or the citation
+    # doesn't survive. No anchor at all (neither brand nor model) means
+    # there's nothing to check against, so those claims can't be trusted
+    # either.
+    anchor = (data.get("model") or data.get("brand") or "").strip().lower()
+    page_text_cache: dict[str, str | None] = {}
+
+    def _page_has_anchor(url: str) -> bool:
+        if not anchor:
+            return False
+        if url not in page_text_cache:
+            try:
+                page_text_cache[url] = page_fetch.fetch_page_text(url)
+            except Exception:
+                logger.warning("Could not fetch cited page %s for sanity check", url)
+                page_text_cache[url] = None
+        text = page_text_cache[url]
+        return text is not None and anchor in text.lower()
+
+    for field, source in list(data_sources.items()):
+        if source != "web":
+            continue
+        url = (source_urls.get(field) or "").strip()
+        if not url or not _page_has_anchor(url):
+            logger.warning(
+                "Field %r cites %s but anchor %r not confirmed on page - downgrading",
+                field,
+                url,
+                anchor,
+            )
+            data_sources[field] = "estimated"
+
+    if data.get("price_found"):
+        price_url = (data.get("price_source_url") or "").strip()
+        if not price_url or not _page_has_anchor(price_url):
+            logger.warning(
+                "price_source_url %r doesn't confirm anchor %r - downgrading price_found",
+                price_url,
+                anchor,
+            )
+            data["price_found"] = False
+
     return data, search_count
 
 
 async def _identify_single_product(
-    bot, chat_id: int, photo: bytes, index: int, total: int
+    bot, chat_id: int, photos: list[bytes], index: int, total: int
 ) -> tuple[dict, dict] | None:
     """Runs the full identify -> validate -> (maybe swap in marketplace
-    photos) pipeline for one photo/product, sending progress messages
-    prefixed with its position in the batch. Returns (prom_row, data), or
-    None if this particular item failed - callers should skip it and keep
-    processing the rest of the batch rather than aborting everything.
+    photos) pipeline for one product (one or more photos of it), sending
+    progress messages prefixed with its position in the batch. Returns
+    (prom_row, data), or None if this particular item failed - callers
+    should skip it and keep processing the rest of the batch rather than
+    aborting everything.
     """
     tag = f"[{index}/{total}]" if total > 1 else ""
     prefix = f"{tag} " if tag else ""
 
     try:
         # Re-host on imgbb: Telegram's own file links can 404 by the time
-        # Prom.ua's async import gets around to fetching them.
-        image_url = image_host.upload_image(photo)
-
-        await bot.send_message(chat_id=chat_id, text=f"{prefix}🌐 Шукаю схожі зображення в інтернеті...")
-        try:
-            image_search_hints = reverse_image_search.find_web_matches(photo)
-        except Exception:
-            logger.exception("Reverse image search failed, continuing without hints")
-            image_search_hints = None
-        logger.info(
-            "Reverse image search: %d page match(es), %d with fetched content",
-            len((image_search_hints or {}).get("page_urls", [])),
-            len((image_search_hints or {}).get("page_contents", {})),
-        )
+        # Prom.ua's async import gets around to fetching them. All of this
+        # product's photos are uploaded and passed to Prom.ua as one
+        # comma-separated field (its import format's convention for
+        # multiple images per listing).
+        image_urls = [image_host.upload_image(photo) for photo in photos]
+        image_url = ", ".join(image_urls)
 
         await bot.send_message(chat_id=chat_id, text=f"{prefix}🔍 Розпізнаю товар...")
-        data, _search_count = _identify_and_validate([photo], image_search_hints)
+        data, _search_count = _identify_and_validate(photos)
 
         await bot.send_message(
             chat_id=chat_id,
@@ -137,7 +193,9 @@ async def _identify_single_product(
 
             # Real confirmed match (price_found gated on a real price_source_url
             # above) - swap the user's own snapshot for the seller's own listing
-            # photos, which are almost always better quality/lighting.
+            # photos, which are almost always better quality/lighting. Every
+            # fallback-to-own-photo path below tells the user why, instead of
+            # silently keeping the original with no explanation.
             try:
                 marketplace_image_urls = product_image_scraper.find_product_image_urls(
                     data["price_source_url"]
@@ -147,7 +205,23 @@ async def _identify_single_product(
                     "Failed to scrape marketplace photos from %s, keeping own photo(s)",
                     data["price_source_url"],
                 )
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"{prefix}ℹ️ Не вдалося завантажити сторінку джерела для фото — "
+                        "залишаю ваше власне фото."
+                    ),
+                )
                 marketplace_image_urls = []
+
+            if data.get("price_found") and not marketplace_image_urls:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"{prefix}ℹ️ На підтвердженій сторінці не знайдено фото товару — "
+                        "залишаю ваше власне фото."
+                    ),
+                )
 
             good_image_bytes = []
             for url in marketplace_image_urls:
@@ -174,10 +248,24 @@ async def _identify_single_product(
                     logger.exception(
                         "Failed to re-host scraped marketplace photos, keeping own photo(s)"
                     )
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"{prefix}ℹ️ Знайдені фото не вдалося завантажити на хостинг — "
+                            "залишаю ваше власне фото."
+                        ),
+                    )
             elif marketplace_image_urls:
                 logger.info(
                     "All %d scraped image(s) failed the quality check, keeping own photo(s)",
                     len(marketplace_image_urls),
+                )
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"{prefix}ℹ️ Знайдено {len(marketplace_image_urls)} фото товару на джерелі, "
+                        "але вони замалі за розміром (нижче 400px) — залишаю ваше власне фото."
+                    ),
                 )
         if not data.get("price_found"):
             await bot.send_message(
@@ -195,26 +283,29 @@ async def _identify_single_product(
         return None
 
 
-async def _process_batch(bot, chat_id: int, photos: list[bytes]) -> None:
-    """Identifies every photo in the batch as its own separate product, then
-    combines all of them into a single Prom.ua import - one API call for
-    the whole batch instead of one per product, since Prom.ua's import
-    endpoint is flaky/rate-limited under repeated back-to-back calls."""
-    total = len(photos)
-    photo_word = "фото" if total == 1 else f"{total} фото"
+async def _process_batch(bot, chat_id: int, groups: list[list[bytes]]) -> None:
+    """Identifies every photo group in the batch as its own separate
+    product, then combines all of them into a single Prom.ua import - one
+    API call for the whole batch instead of one per product, since Prom.ua's
+    import endpoint is flaky/rate-limited under repeated back-to-back
+    calls."""
+    total = len(groups)
+    photo_count = sum(len(group) for group in groups)
+    photo_word = "фото" if photo_count == 1 else f"{photo_count} фото"
+    product_word = "товар" if total == 1 else f"{total} товар(и/ів)"
     await bot.send_message(
         chat_id=chat_id,
-        text=f"📸 Отримано {photo_word}. Кожне фото — окремий товар. Обробляю по черзі...",
+        text=f"📸 Отримано {photo_word} ({product_word}). Обробляю по черзі...",
     )
 
     products = []
-    identified = []  # (photo, data) pairs, for the sales-group price queue below
-    for index, photo in enumerate(photos, start=1):
-        result = await _identify_single_product(bot, chat_id, photo, index, total)
+    identified = []  # (photos, data) pairs, for the sales-group price queue below
+    for index, photos in enumerate(groups, start=1):
+        result = await _identify_single_product(bot, chat_id, photos, index, total)
         if result is not None:
             product, data = result
             products.append(product)
-            identified.append((photo, data))
+            identified.append((photos, data))
 
     if not products:
         await bot.send_message(chat_id=chat_id, text="❌ Жоден товар не вдалося розпізнати, нічого завантажувати.")
@@ -258,7 +349,7 @@ async def _process_batch(bot, chat_id: int, photos: list[bytes]) -> None:
         _pending_price_requests[chat_id] = {"queue": identified, "awaiting": False}
         await bot.send_message(
             chat_id=chat_id,
-            text="💬 Тепер вкажіть ціни для групи продажів (по одній, у відповідь на запит):",
+            text="💬 Тепер оберіть, які товари додати в групу продажів (по одному, у відповідь на запит):",
         )
         await _ask_next_price(bot, chat_id)
 
@@ -268,22 +359,34 @@ async def _ask_next_price(bot, chat_id: int) -> None:
     if not state or not state["queue"]:
         _pending_price_requests.pop(chat_id, None)
         return
-    _photo, data = state["queue"][0]
+    _photos, data = state["queue"][0]
     state["awaiting"] = True
     await bot.send_message(
         chat_id=chat_id,
-        text=f"💬 Яка ціна для «{data.get('name', '')}» у групі продажів? Напишіть число.",
+        text=(
+            f"💬 Додати «{data.get('name', '')}» в групу продажів? "
+            "Якщо так - напишіть ціну, якщо ні - напишіть «ні»."
+        ),
     )
 
 
-async def _post_to_sales_group(bot, chat_id: int, photo: bytes, data: dict, price: float) -> None:
+async def _post_to_sales_group(bot, chat_id: int, photos: list[bytes], data: dict, price: float) -> None:
     caption = (
         f"{data.get('name', '')}\n\n"
         f"Ціна: {price:.0f} грн\n\n"
         f"Щоб купити, напишіть нашому менеджеру: {config.MANAGER_CONTACT_URL}"
     )
     try:
-        await bot.send_photo(chat_id=config.SALES_GROUP_CHAT_ID, photo=photo, caption=caption)
+        if len(photos) > 1:
+            # sendMediaGroup only shows the caption of the first item as the
+            # album's caption - the rest are left uncaptioned on purpose.
+            media = [
+                InputMediaPhoto(photo, caption=caption if i == 0 else None)
+                for i, photo in enumerate(photos)
+            ]
+            await bot.send_media_group(chat_id=config.SALES_GROUP_CHAT_ID, media=media)
+        else:
+            await bot.send_photo(chat_id=config.SALES_GROUP_CHAT_ID, photo=photos[0], caption=caption)
         await bot.send_message(chat_id=chat_id, text="✅ Додано в групу продажів")
     except Exception as exc:
         logger.exception("Failed to post to sales group")
@@ -306,31 +409,73 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         update.message.text[:200],
     )
 
+    answer = update.message.text.strip()
+    answer_lower = answer.lower()
+
+    batch = _pending_batches.get(chat_id)
+    if batch and batch.get("awaiting_continue"):
+        if answer_lower in _YES_ANSWERS:
+            batch["awaiting_continue"] = False
+            await context.bot.send_message(chat_id=chat_id, text="👍 Надсилайте фото наступного товару.")
+        elif answer_lower in _NO_ANSWERS:
+            groups = batch["groups"]
+            _pending_batches.pop(chat_id, None)
+            await _process_batch(context.bot, chat_id, groups)
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id, text="⚠️ Не зрозумів відповідь. Напишіть «так» або «ні»."
+            )
+        return
+
     state = _pending_price_requests.get(chat_id)
     if not state or not state.get("awaiting"):
         return
 
+    if answer_lower in _NO_ANSWERS:
+        _photos, data = state["queue"].pop(0)
+        state["awaiting"] = False
+        await context.bot.send_message(
+            chat_id=chat_id, text=f"⏭️ Пропущено «{data.get('name', '')}», не додано в групу продажів"
+        )
+        await _ask_next_price(context.bot, chat_id)
+        return
+
     try:
-        price = float(update.message.text.strip().replace(",", "."))
+        price = float(answer.replace(",", "."))
     except ValueError:
         await context.bot.send_message(
-            chat_id=chat_id, text="⚠️ Не розпізнав число. Введіть ціну ще раз, наприклад: 450"
+            chat_id=chat_id,
+            text="⚠️ Не розпізнав відповідь. Напишіть ціну числом, або «ні», щоб не додавати товар.",
         )
         return
 
-    photo, data = state["queue"].pop(0)
+    photos, data = state["queue"].pop(0)
     state["awaiting"] = False
-    await _post_to_sales_group(context.bot, chat_id, photo, data, price)
+    await _post_to_sales_group(context.bot, chat_id, photos, data, price)
     await _ask_next_price(context.bot, chat_id)
 
 
-async def _flush_batch(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _finalize_current_group(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.data
-    batch = _pending_batches.pop(chat_id, None)
-    if not batch:
+    batch = _pending_batches.get(chat_id)
+    if not batch or not batch["current_group"]:
         return
-    logger.info("Flushing batch for chat %s (%d photo(s))", chat_id, len(batch["photos"]))
-    await _process_batch(context.bot, chat_id, batch["photos"])
+
+    batch["groups"].append(batch["current_group"])
+    photo_count = len(batch["current_group"])
+    batch["current_group"] = None
+    batch["current_media_group_id"] = None
+    batch["job"] = None
+    batch["awaiting_continue"] = True
+
+    photo_word = "фото" if photo_count == 1 else f"{photo_count} фото"
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"📦 Товар #{len(batch['groups'])} додано до черги ({photo_word}). "
+            "Додати ще один товар? (так/ні)"
+        ),
+    )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -338,21 +483,48 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     chat_id = update.message.chat.id
-    logger.info("Photo received from chat %s", chat_id)
+    media_group_id = update.message.media_group_id
+    logger.info("Photo received from chat %s (media_group_id=%s)", chat_id, media_group_id)
 
     photo = update.message.photo[-1]
     photo_file = await photo.get_file()
     image_bytes = bytes(await photo_file.download_as_bytearray())
 
-    # Every photo - whether sent alone, as a Telegram album, or as several
-    # separate messages - is buffered here as its own product and the batch
-    # is processed once no new photo has arrived for BATCH_FLUSH_DELAY.
-    batch = _pending_batches.setdefault(chat_id, {"photos": [], "job": None})
-    batch["photos"].append(image_bytes)
+    # Photos sharing a media_group_id (sent together as one Telegram album)
+    # are collected as multiple photos of the SAME product; anything else
+    # (a lone photo, or one whose media_group_id differs from the group
+    # currently being collected) starts a new product.
+    batch = _pending_batches.setdefault(
+        chat_id,
+        {
+            "groups": [],
+            "current_group": None,
+            "current_media_group_id": None,
+            "job": None,
+            "awaiting_continue": False,
+        },
+    )
+
+    # A photo arriving while we're waiting on "add another product?" starts
+    # the next product implicitly - no need to make the user type "так" first.
+    batch["awaiting_continue"] = False
+
+    same_group = (
+        batch["current_group"] is not None
+        and media_group_id is not None
+        and media_group_id == batch["current_media_group_id"]
+    )
+    if same_group:
+        batch["current_group"].append(image_bytes)
+    else:
+        if batch["current_group"]:
+            batch["groups"].append(batch["current_group"])
+        batch["current_group"] = [image_bytes]
+        batch["current_media_group_id"] = media_group_id
 
     if batch["job"] is not None:
         batch["job"].schedule_removal()
-    batch["job"] = context.job_queue.run_once(_flush_batch, BATCH_FLUSH_DELAY, data=chat_id)
+    batch["job"] = context.job_queue.run_once(_finalize_current_group, ALBUM_COLLECT_DELAY, data=chat_id)
 
 
 def main() -> None:

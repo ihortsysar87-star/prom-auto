@@ -451,10 +451,12 @@
           <span class="mono">telegram_bot.py</span> now buffers those for
           ~1.5s after the last one arrives, then processes the whole album as
           a single product: all photos go to <span class="mono">openai_client.identify_product()</span>
-          for identification, and all of them are joined with <span class="mono">;</span>
-          into Prom.ua's <span class="mono">Посилання_зображення</span> field
-          (its documented separator for multiple images). A single photo with
-          no album still works exactly as before.
+          for identification, and all of them are joined with <span class="mono">, </span>
+          (comma + space) into Prom.ua's <span class="mono">Посилання_зображення</span> field
+          (its documented separator for multiple images — an earlier version of
+          this used <span class="mono">;</span>, which silently dropped every
+          image but the first). A single photo with no album still works
+          exactly as before.
         </li>
         <li>
           <b>Prom.ua import headers — fixed.</b> The first live test failed
