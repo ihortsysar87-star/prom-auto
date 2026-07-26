@@ -1,4 +1,6 @@
 import logging
+import re
+import urllib.parse
 
 from telegram import InputMediaPhoto, Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
@@ -83,72 +85,177 @@ def _format_data_sources(data_sources: dict, source_urls: dict | None = None) ->
     return "ℹ️ Джерела даних — " + "; ".join(parts) if parts else ""
 
 
+def _normalize_url(url: str) -> str:
+    """Strips query string/fragment/trailing-slash so a citation URL and the
+    (possibly slightly reformatted) copy of it the model writes into
+    source_urls still compare equal - e.g. a tracking param or trailing
+    slash shouldn't make a genuinely cited page look uncited."""
+    parsed = urllib.parse.urlsplit(url.strip())
+    path = parsed.path.rstrip("/")
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, "", ""))
+
+
+def _normalize_for_match(text: str) -> str:
+    """Lowercases and collapses everything but letters/digits to single
+    spaces, so "iPhone 15 Pro Max" and "iPhone-15 Pro/Max!!" (real-world
+    punctuation/spacing drift between what the model wrote and what's
+    literally in a page's HTML) compare equal instead of failing a naive
+    substring check."""
+    return " ".join(re.findall(r"[\w']+", text.lower()))
+
+
+def _anchor_words_present(anchor_normalized: str, text_normalized: str) -> bool:
+    """True if every significant (3+ char) word of the anchor shows up
+    somewhere in the page text, order-independent. Looser than an exact
+    substring match (which real pages routinely fail on for trivial
+    formatting reasons) while still requiring genuine word-level overlap."""
+    words = [w for w in anchor_normalized.split() if len(w) >= 3]
+    if not words:
+        return anchor_normalized and anchor_normalized in text_normalized
+    return all(w in text_normalized for w in words)
+
+
 def _identify_and_validate(photos: list[bytes]) -> tuple[dict, int]:
     """Runs identify_product once and enforces that any "web" data_source
-    claim is backed by a real URL, downgrading it to "estimated" otherwise -
-    a "web" self-report is only as trustworthy as the source_urls/
-    price_source_url entry behind it, regardless of how many searches ran.
+    claim is backed by a real URL the model's own search tool actually
+    visited, downgrading to "estimated" otherwise - a "web" self-report is
+    only as trustworthy as the evidence behind it, regardless of how many
+    searches ran.
 
     Returns (data, search_count).
     """
-    response, search_count = openai_client.identify_product(photos)
+    response, search_count, cited_urls = openai_client.identify_product(photos)
     data = openai_client.extract_json(response)
     logger.info("Full identification data (%d web search(es)): %s", search_count, data)
 
     data_sources = data.get("data_sources") or {}
     source_urls = data.get("source_urls") or {}
-    for field, source in data_sources.items():
-        if source == "web" and not (source_urls.get(field) or "").strip():
-            logger.warning("Field %r marked 'web' with no source_urls entry - downgrading", field)
-            data_sources[field] = "estimated"
+    data["source_urls"] = source_urls  # keep linked even if data had no source_urls at all
     if data.get("price_found") and not (data.get("price_source_url") or "").strip():
         logger.warning("price_found=True with no price_source_url - downgrading")
         data["price_found"] = False
 
-    # A real URL isn't proof the page is actually about THIS product -
-    # confirmed empirically (two "web"-confirmed citations in a row were
-    # both for the wrong item). Cheap sanity check: the brand/model anchor
-    # must actually appear in the cited page's real text, or the citation
-    # doesn't survive. No anchor at all (neither brand nor model) means
-    # there's nothing to check against, so those claims can't be trusted
-    # either.
-    anchor = (data.get("model") or data.get("brand") or "").strip().lower()
+    # A field marked "web" with no URL of its own isn't necessarily
+    # unconfirmed - one confirmed listing page backs every field it
+    # describes (name, brand, material, ...), and the model routinely only
+    # bothers to write the URL once (as price_source_url, or against
+    # whichever single field it considered primary) rather than repeating it
+    # for every other field it also read off the same page. Treating that as
+    # "no evidence" was downgrading fields that actually did have real
+    # backing - fall back to any other confirmed URL already on this product
+    # before giving up on it.
+    fallback_url = next(
+        (u.strip() for u in [data.get("price_source_url"), *source_urls.values()] if u and u.strip()),
+        "",
+    )
+    for field, source in data_sources.items():
+        if source == "web" and not (source_urls.get(field) or "").strip():
+            if fallback_url:
+                source_urls[field] = fallback_url
+            else:
+                logger.warning("Field %r marked 'web' with no source_urls entry - downgrading", field)
+                data_sources[field] = "estimated"
+
+    # Two layers of evidence for a "web" claim, from strongest to weakest:
+    #   1. The URL must be one the model's search tool actually retrieved
+    #      (a real url_citation), not just a plausible-looking string it
+    #      typed into the JSON - this is the main defense against
+    #      hallucinated sources, and it's real evidence we already had but
+    #      used to throw away.
+    #   2. IF we can independently re-fetch that page ourselves AND the
+    #      product has a brand/model to check for, the anchor should appear
+    #      in it (fuzzy, word-level - see _anchor_words_present) as extra
+    #      corroboration. But failing to fetch (bot-blocked, JS-rendered
+    #      page) or having no brand/model at all (common for generic,
+    #      unbranded products) must NOT be treated as "wrong" - only a
+    #      genuinely uncited URL is. Conflating "couldn't independently
+    #      verify" with "verified wrong" was the main reason legitimate
+    #      matches for brandless products or bot-protected sites were being
+    #      silently downgraded to "not found".
+    #
+    #   Brand and model are checked as SEPARATE candidate anchors (match on
+    #   either, not just model-first-else-brand) - many store-brand/private
+    #   label products (e.g. Lidl's "Ernesto" line) have a "model" that's
+    #   really the manufacturer's internal packaging code (an IAN number in
+    #   Ernesto's case), which legitimate third-party listings never
+    #   reprint verbatim even for a correct match, while the brand name
+    #   almost always does appear. Requiring the model specifically to
+    #   match was silently downgrading correct matches for exactly these
+    #   products.
+    brand_anchor = _normalize_for_match((data.get("brand") or "").strip())
+    model_anchor = _normalize_for_match((data.get("model") or "").strip())
+    anchors = [a for a in (brand_anchor, model_anchor) if a]
+    normalized_cited = {_normalize_url(u) for u in cited_urls}
     page_text_cache: dict[str, str | None] = {}
 
-    def _page_has_anchor(url: str) -> bool:
-        if not anchor:
-            return False
+    def _is_cited(url: str) -> bool:
+        return _normalize_url(url) in normalized_cited
+
+    def _fetch_confirms_anchor(url: str) -> bool | None:
+        """None means "couldn't check" (no anchor to check, or fetch
+        failed) - distinct from True/False so callers don't mistake
+        "unknown" for "disproven"."""
+        if not anchors:
+            return None
         if url not in page_text_cache:
             try:
                 page_text_cache[url] = page_fetch.fetch_page_text(url)
             except Exception:
-                logger.warning("Could not fetch cited page %s for sanity check", url)
+                logger.info("Could not independently fetch %s (bot-blocked/JS page?) - relying on citation alone", url)
                 page_text_cache[url] = None
         text = page_text_cache[url]
-        return text is not None and anchor in text.lower()
+        if text is None:
+            return None
+        normalized_text = _normalize_for_match(text)
+        return any(_anchor_words_present(a, normalized_text) for a in anchors)
+
+    def _validate_url(field_label: str, url: str) -> bool:
+        if not url or not _is_cited(url):
+            logger.warning(
+                "%s cites %s but that URL was never actually retrieved by web_search - downgrading",
+                field_label,
+                url,
+            )
+            return False
+        confirmed = _fetch_confirms_anchor(url)
+        if confirmed is False:
+            logger.warning(
+                "%s cites %s (a real search result) but none of anchors %r found on independent re-fetch - downgrading",
+                field_label,
+                url,
+                anchors,
+            )
+            return False
+        return True
 
     for field, source in list(data_sources.items()):
         if source != "web":
             continue
         url = (source_urls.get(field) or "").strip()
-        if not url or not _page_has_anchor(url):
-            logger.warning(
-                "Field %r cites %s but anchor %r not confirmed on page - downgrading",
-                field,
-                url,
-                anchor,
-            )
+        if not _validate_url(f"Field {field!r}", url):
             data_sources[field] = "estimated"
 
     if data.get("price_found"):
         price_url = (data.get("price_source_url") or "").strip()
-        if not price_url or not _page_has_anchor(price_url):
-            logger.warning(
-                "price_source_url %r doesn't confirm anchor %r - downgrading price_found",
-                price_url,
-                anchor,
-            )
+        if not _validate_url("price_source_url", price_url):
             data["price_found"] = False
+
+    # Distinct from price_found: whether the PRODUCT ITSELF was confirmed by
+    # a real, validated web match, regardless of whether that page happened
+    # to list a price. Manufacturer pages, spec sheets, and catalog listings
+    # routinely confirm the exact product with no price on them at all -
+    # treating "no price on the page" the same as "product not found" was
+    # the main reason correctly-identified products were reported to the
+    # user as unconfirmed. Both sides here only ever hold URLs that already
+    # passed _validate_url above (price_source_url only counts if
+    # price_found is still True; data_sources[f] == "web" only survives for
+    # fields that passed the loop above).
+    price_confirmed_url = (data.get("price_source_url") or "").strip() if data.get("price_found") else ""
+    field_confirmed_url = next(
+        (source_urls[f] for f, s in data_sources.items() if s == "web" and (source_urls.get(f) or "").strip()),
+        "",
+    )
+    data["confirmed_source_url"] = price_confirmed_url or field_confirmed_url or None
 
     return data, search_count
 
@@ -185,25 +292,34 @@ async def _identify_single_product(
         sources_text = _format_data_sources(data.get("data_sources"), data.get("source_urls"))
         if sources_text:
             await bot.send_message(chat_id=chat_id, text=f"{prefix}{sources_text}")
+
+        # confirmed_source_url (set in _identify_and_validate) means the
+        # PRODUCT ITSELF was confirmed by a real, validated web match - this
+        # is intentionally NOT the same gate as price_found, since a page
+        # can confirm the exact product (manufacturer site, spec sheet,
+        # catalog listing) with no price on it at all. Conflating the two
+        # was reporting correctly-identified products to the user as
+        # "not found" just because that particular page had no price.
+        confirmed_url = data.get("confirmed_source_url")
+
         if data.get("price_found") and data.get("price_source_url"):
             await bot.send_message(
                 chat_id=chat_id,
                 text=f"{prefix}💰 Ціну підтверджено тут: {data['price_source_url']}",
             )
 
-            # Real confirmed match (price_found gated on a real price_source_url
-            # above) - swap the user's own snapshot for the seller's own listing
-            # photos, which are almost always better quality/lighting. Every
-            # fallback-to-own-photo path below tells the user why, instead of
-            # silently keeping the original with no explanation.
+        if confirmed_url:
+            # Swap the user's own snapshot for the seller's/manufacturer's
+            # own listing photos, which are almost always better
+            # quality/lighting. Every fallback-to-own-photo path below
+            # tells the user why, instead of silently keeping the original
+            # with no explanation.
             try:
-                marketplace_image_urls = product_image_scraper.find_product_image_urls(
-                    data["price_source_url"]
-                )
+                marketplace_image_urls = product_image_scraper.find_product_image_urls(confirmed_url)
             except Exception:
                 logger.exception(
                     "Failed to scrape marketplace photos from %s, keeping own photo(s)",
-                    data["price_source_url"],
+                    confirmed_url,
                 )
                 await bot.send_message(
                     chat_id=chat_id,
@@ -214,7 +330,7 @@ async def _identify_single_product(
                 )
                 marketplace_image_urls = []
 
-            if data.get("price_found") and not marketplace_image_urls:
+            if not marketplace_image_urls:
                 await bot.send_message(
                     chat_id=chat_id,
                     text=(
@@ -267,7 +383,7 @@ async def _identify_single_product(
                         "але вони замалі за розміром (нижче 400px) — залишаю ваше власне фото."
                     ),
                 )
-        if not data.get("price_found"):
+        else:
             await bot.send_message(
                 chat_id=chat_id,
                 text=(
