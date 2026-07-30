@@ -50,15 +50,26 @@ _pending_price_requests: dict[int, dict] = {}
 
 # chat_id -> "awaiting_choice" | "url" | "photo". Set by /start (prompts the
 # link-vs-photo choice) and by the yes/no answer to it; drives which branch
-# handle_text/handle_photo take for that chat. Missing entirely == legacy
-# behavior (bare photo mode, no prompt), so chats that never ran /start keep
-# working exactly as before.
+# handle_text/handle_photo take for that chat. Missing entirely means the
+# chat hasn't committed to a mode yet: the first photo defaults it to bare
+# photo mode (legacy behavior, no prompt needed), while the first message
+# that looks like a URL implicitly commits it to link mode instead - see the
+# "mode is None" branch in handle_text - so /start is a convenience, not a
+# requirement, for either flow.
 _chat_mode: dict[int, str] = {}
 
-# chat_id -> {"products": list[dict], "data_list": list[dict]}. Link-mode's
-# equivalent of _pending_batches: one entry per successfully identified URL,
-# collected until the user sends a _DONE_ANSWERS reply.
+# chat_id -> {"products": list[dict], "data_list": list[tuple[list[str], dict]]}.
+# Link-mode's equivalent of _pending_batches: one entry per successfully
+# identified URL, collected until the user sends a _DONE_ANSWERS reply.
 _pending_url_batches: dict[int, dict] = {}
+
+# chat_id -> {"queue": list[tuple[list[str], dict]], "awaiting": bool}.
+# Link-mode's equivalent of _pending_price_requests: one entry per
+# successfully identified URL-mode product, asked one at a time whether to
+# post it to the sales group. Unlike photo mode, link-mode already has a
+# real, source-derived (and discounted) price, so this only needs a yes/no
+# confirmation rather than the user typing a price.
+_pending_group_confirmations: dict[int, dict] = {}
 
 # Ukrainian/English yes-no answers, used both for "add another product?" and
 # for the per-product sales-group prompt.
@@ -67,6 +78,20 @@ _NO_ANSWERS = {"ні", "ни", "нет", "no", "n"}
 
 # Marks the end of a link-mode batch (user has no more URLs to send).
 _DONE_ANSWERS = {"готово", "стоп", "done", "кінець", "закінчити"}
+
+# Matches many "share" formats apps produce (e.g. eMag's share sheet sends
+# "<url> <page title> - eMAG.hu" as one message): grabs just the URL token,
+# stopping at the first whitespace, instead of the full raw text. Passing
+# the untrimmed text straight to requests.get() let it silently
+# percent-encode the trailing title's spaces into the path, turning a valid
+# product URL into a broken one that 403s on both the direct fetch and the
+# reader-proxy fallback.
+_URL_PATTERN = re.compile(r"https?://\S+")
+
+
+def _extract_url(text: str) -> str | None:
+    match = _URL_PATTERN.search(text)
+    return match.group(0) if match else None
 
 _MODE_QUESTION = (
     "Вітаю! Як бажаєте передати товари?\n\n"
@@ -508,14 +533,22 @@ async def _ask_next_price(bot, chat_id: int) -> None:
     )
 
 
-async def _post_to_sales_group(bot, chat_id: int, photos: list[bytes], data: dict, price: float) -> None:
+async def _post_to_sales_group(
+    bot, chat_id: int, photos: list[bytes] | list[str], data: dict, price: float
+) -> None:
+    """photos is either raw Telegram photo bytes (photo mode) or already-
+    hosted image URLs (link mode) - InputMediaPhoto/send_photo accept both
+    interchangeably, so no other branching is needed between the two
+    callers."""
     caption = (
         f"{data.get('name', '')}\n\n"
         f"Ціна: {price:.0f} грн\n\n"
         f"Щоб купити, напишіть нашому менеджеру: {config.MANAGER_CONTACT_URL}"
     )
     try:
-        if len(photos) > 1:
+        if not photos:
+            await bot.send_message(chat_id=config.SALES_GROUP_CHAT_ID, text=caption)
+        elif len(photos) > 1:
             # sendMediaGroup only shows the caption of the first item as the
             # album's caption - the rest are left uncaptioned on purpose.
             media = [
@@ -540,10 +573,12 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await context.bot.send_message(chat_id=chat_id, text=_MODE_QUESTION)
 
 
-async def _identify_single_url_product(bot, chat_id: int, url: str, index: int) -> dict | None:
+async def _identify_single_url_product(
+    bot, chat_id: int, url: str, index: int
+) -> tuple[dict, dict, list[str]] | None:
     """Runs the link-mode identify -> price/discount -> images pipeline for
     one URL, sending progress messages prefixed with its position in the
-    batch. Returns the Prom.ua row dict, or None if this URL failed -
+    batch. Returns (prom_row, data, image_urls), or None if this URL failed -
     callers should skip it and keep processing the rest of the batch."""
     tag = f"[{index}]"
 
@@ -583,7 +618,7 @@ async def _identify_single_url_product(bot, chat_id: int, url: str, index: int) 
             "(знижка 5% від ціни джерела вже враховано). Надішліть наступне посилання, або напишіть «готово»."
         ),
     )
-    return prom_row
+    return prom_row, data, image_urls
 
 
 async def _handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -593,15 +628,17 @@ async def _handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if text.lower() in _DONE_ANSWERS:
         products = batch["products"]
+        data_list = batch["data_list"]
         _pending_url_batches.pop(chat_id, None)
         _chat_mode.pop(chat_id, None)
         if not products:
             await context.bot.send_message(chat_id=chat_id, text="⚠️ Жодного товару не додано, нічого завантажувати.")
             return
-        await _finalize_url_batch(context.bot, chat_id, products)
+        await _finalize_url_batch(context.bot, chat_id, products, data_list)
         return
 
-    if not text.lower().startswith(("http://", "https://")):
+    url = _extract_url(text)
+    if url is None:
         await context.bot.send_message(
             chat_id=chat_id,
             text="⚠️ Це не схоже на посилання. Надішліть URL товару, або напишіть «готово», щоб завершити.",
@@ -609,12 +646,16 @@ async def _handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     index = len(batch["products"]) + 1
-    row = await _identify_single_url_product(context.bot, chat_id, text, index)
-    if row is not None:
+    result = await _identify_single_url_product(context.bot, chat_id, url, index)
+    if result is not None:
+        row, data, image_urls = result
         batch["products"].append(row)
+        batch["data_list"].append((image_urls, data))
 
 
-async def _finalize_url_batch(bot, chat_id: int, products: list[dict]) -> None:
+async def _finalize_url_batch(
+    bot, chat_id: int, products: list[dict], data_list: list[tuple[list[str], dict]]
+) -> None:
     """Same tail as _process_batch: one xlsx, one Prom.ua import call for
     the whole link-mode batch."""
     xlsx_bytes = xlsx_builder.build_xlsx(products)
@@ -646,6 +687,51 @@ async def _finalize_url_batch(bot, chat_id: int, products: list[dict]) -> None:
     except Exception as exc:
         logger.exception("Prom.ua import failed")
         await bot.send_message(chat_id=chat_id, text=f"❌ Помилка передачі на Пром: {exc}")
+
+    # Same post-import sales-group hand-off as photo mode - not gated on
+    # Prom.ua's own outcome, since it's a separate customer-facing channel.
+    # Link-mode already has a real, source-derived price (unlike photo mode,
+    # which has to ask the user to type one), so this only needs a yes/no
+    # confirmation per product rather than a price prompt.
+    if data_list and config.SALES_GROUP_CHAT_ID:
+        _pending_group_confirmations[chat_id] = {"queue": list(data_list), "awaiting": False}
+        await bot.send_message(
+            chat_id=chat_id,
+            text="💬 Тепер підтвердіть, які товари додати в групу продажів (по одному, у відповідь на запит):",
+        )
+        await _ask_next_group_confirmation(bot, chat_id)
+
+
+async def _ask_next_group_confirmation(bot, chat_id: int) -> None:
+    state = _pending_group_confirmations.get(chat_id)
+    if not state:
+        return
+    while state["queue"]:
+        _image_urls, data = state["queue"][0]
+        if not data.get("price_found"):
+            # No real price to post with (already flagged to the user per-
+            # product during identification) - skip straight past it instead
+            # of asking for a price the way photo mode would.
+            state["queue"].pop(0)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⏭️ «{data.get('name', '')}» пропущено для групи продажів - "
+                    "ціну джерела не знайдено."
+                ),
+            )
+            continue
+        state["awaiting"] = True
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"💬 Додати «{data.get('name', '')}» в групу продажів за {data['priceUAH']:.0f} грн "
+                "(ціна з сайту-джерела, знижка 5% вже враховано)? "
+                "Будь-яка відповідь = так, для відмови напишіть «ні»."
+            ),
+        )
+        return
+    _pending_group_confirmations.pop(chat_id, None)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -705,6 +791,33 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await context.bot.send_message(
                 chat_id=chat_id, text="⚠️ Не зрозумів відповідь. Напишіть «так» або «ні»."
             )
+        return
+
+    # No mode committed yet (never ran /start, or a previous batch already
+    # finished and cleared it) and no photo-batch is in progress for this
+    # chat: a bare URL here is unambiguous, so commit to link mode
+    # implicitly instead of silently dropping the message - the user
+    # shouldn't have to run /start just to paste a link.
+    if mode is None and not batch and _extract_url(answer) is not None:
+        _chat_mode[chat_id] = "url"
+        _pending_url_batches[chat_id] = {"products": [], "data_list": []}
+        await _handle_url_message(update, context)
+        return
+
+    group_state = _pending_group_confirmations.get(chat_id)
+    if group_state and group_state.get("awaiting"):
+        # No strict так/ні matching here on purpose - any reply confirms
+        # ("додати" is the default action), and only an explicit "ні"/"no"
+        # declines. Anything typed is treated as intent to add.
+        image_urls, data = group_state["queue"].pop(0)
+        group_state["awaiting"] = False
+        if answer_lower in _NO_ANSWERS:
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"⏭️ Пропущено «{data.get('name', '')}», не додано в групу продажів"
+            )
+        else:
+            await _post_to_sales_group(context.bot, chat_id, image_urls, data, data["priceUAH"])
+        await _ask_next_group_confirmation(context.bot, chat_id)
         return
 
     state = _pending_price_requests.get(chat_id)
