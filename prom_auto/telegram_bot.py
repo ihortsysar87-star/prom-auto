@@ -449,6 +449,49 @@ async def _identify_single_product(
         return None
 
 
+def _format_import_errors(errors: list) -> str:
+    """Flattens ImportStatus's `errors` array (a list of {stage: details}
+    dicts, one per failing stage - download/store_file/validation/import/
+    download_images) into short readable text for a Telegram message."""
+    parts = []
+    for entry in errors or []:
+        if not isinstance(entry, dict):
+            parts.append(str(entry))
+            continue
+        for stage, details in entry.items():
+            if details:
+                parts.append(f"{stage}: {details}")
+    return "; ".join(parts) if parts else "деталі не надано"
+
+
+async def _report_import_result(bot, chat_id: int, status_payload: dict, total: int) -> None:
+    """Reports what Prom.ua's async import job actually did, instead of the
+    old behavior of declaring success as soon as the upload was merely
+    accepted - POST /products/import_file's own "status" field only reflects
+    whether the *file* passed input validation, not whether any product was
+    actually created, so a row can be silently rejected (bad price, missing
+    category, etc.) with no error ever surfaced to the user."""
+    prom_status = str(status_payload.get("status", "")).upper()
+    created = status_payload.get("created", 0)
+    updated = status_payload.get("updated", 0)
+    with_errors = status_payload.get("with_errors_count", 0)
+
+    if prom_status == "SUCCESS" and not with_errors:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"✅ {total} товар(и/ів) успішно передано в Пром (створено: {created}, оновлено: {updated})",
+        )
+    else:
+        details = _format_import_errors(status_payload.get("errors"))
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚠️ Prom.ua обробив імпорт, але {with_errors} з {total} товар(и/ів) НЕ додано "
+                f"(створено: {created}, оновлено: {updated}). Деталі: {details}"
+            ),
+        )
+
+
 async def _process_batch(bot, chat_id: int, groups: list[list[bytes]]) -> None:
     """Identifies every photo group in the batch as its own separate
     product, then combines all of them into a single Prom.ua import - one
@@ -484,17 +527,9 @@ async def _process_batch(bot, chat_id: int, groups: list[list[bytes]]) -> None:
         text=f"⬆️ Завантажую {len(products)} товар(и/ів) до Prom.ua одним запитом...",
     )
     try:
-        result = prom_client.import_file(xlsx_bytes)
-        logger.info("Prom.ua import result: %s", result)
-        if result.get("status") == "success" or "id" in result:
-            await bot.send_message(
-                chat_id=chat_id, text=f"✅ {len(products)} товар(и/ів) успішно передано в Пром"
-            )
-        else:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ Помилка передачі на Пром: {result.get('error', '')}",
-            )
+        status_payload = prom_client.import_and_wait(xlsx_bytes)
+        logger.info("Prom.ua import status: %s", status_payload)
+        await _report_import_result(bot, chat_id, status_payload, len(products))
     except prom_client.PromImportBusyError:
         logger.warning("Prom.ua import busy after retries (likely nightly restriction)")
         await bot.send_message(
@@ -502,6 +537,15 @@ async def _process_batch(bot, chat_id: int, groups: list[list[bytes]]) -> None:
             text=(
                 "⏳ Prom.ua зараз не приймає імпорт (схоже на їхнє нічне обмеження). "
                 "Це не помилка бота — спробуйте надіслати фото ще раз пізніше."
+            ),
+        )
+    except prom_client.PromImportStillProcessingError as exc:
+        logger.warning("Prom.ua import still processing after poll budget: %s", exc.last_status)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⏳ Prom.ua обробляє імпорт довше звичайного — перевірте наявність "
+                "товару в кабінеті за кілька хвилин."
             ),
         )
     except Exception as exc:
@@ -667,17 +711,9 @@ async def _finalize_url_batch(
         text=f"⬆️ Завантажую {len(products)} товар(и/ів) до Prom.ua одним запитом...",
     )
     try:
-        result = prom_client.import_file(xlsx_bytes)
-        logger.info("Prom.ua import result: %s", result)
-        if result.get("status") == "success" or "id" in result:
-            await bot.send_message(
-                chat_id=chat_id, text=f"✅ {len(products)} товар(и/ів) успішно передано в Пром"
-            )
-        else:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ Помилка передачі на Пром: {result.get('error', '')}",
-            )
+        status_payload = prom_client.import_and_wait(xlsx_bytes)
+        logger.info("Prom.ua import status: %s", status_payload)
+        await _report_import_result(bot, chat_id, status_payload, len(products))
     except prom_client.PromImportBusyError:
         logger.warning("Prom.ua import busy after retries (likely nightly restriction)")
         await bot.send_message(
@@ -685,6 +721,15 @@ async def _finalize_url_batch(
             text=(
                 "⏳ Prom.ua зараз не приймає імпорт (схоже на їхнє нічне обмеження). "
                 "Це не помилка бота - спробуйте /start ще раз пізніше."
+            ),
+        )
+    except prom_client.PromImportStillProcessingError as exc:
+        logger.warning("Prom.ua import still processing after poll budget: %s", exc.last_status)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⏳ Prom.ua обробляє імпорт довше звичайного — перевірте наявність "
+                "товару в кабінеті за кілька хвилин."
             ),
         )
     except Exception as exc:
