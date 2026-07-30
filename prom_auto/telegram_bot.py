@@ -3,13 +3,14 @@ import re
 import urllib.parse
 
 from telegram import InputMediaPhoto, Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from . import (
     config,
     image_host,
     openai_client,
     page_fetch,
+    product_data_extractor,
     product_image_scraper,
     prom_client,
     product_mapper,
@@ -47,10 +48,31 @@ _pending_batches: dict[int, dict] = {}
 # successfully identified product, asked one at a time.
 _pending_price_requests: dict[int, dict] = {}
 
+# chat_id -> "awaiting_choice" | "url" | "photo". Set by /start (prompts the
+# link-vs-photo choice) and by the yes/no answer to it; drives which branch
+# handle_text/handle_photo take for that chat. Missing entirely == legacy
+# behavior (bare photo mode, no prompt), so chats that never ran /start keep
+# working exactly as before.
+_chat_mode: dict[int, str] = {}
+
+# chat_id -> {"products": list[dict], "data_list": list[dict]}. Link-mode's
+# equivalent of _pending_batches: one entry per successfully identified URL,
+# collected until the user sends a _DONE_ANSWERS reply.
+_pending_url_batches: dict[int, dict] = {}
+
 # Ukrainian/English yes-no answers, used both for "add another product?" and
 # for the per-product sales-group prompt.
 _YES_ANSWERS = {"так", "да", "yes", "y"}
 _NO_ANSWERS = {"ні", "ни", "нет", "no", "n"}
+
+# Marks the end of a link-mode batch (user has no more URLs to send).
+_DONE_ANSWERS = {"готово", "стоп", "done", "кінець", "закінчити"}
+
+_MODE_QUESTION = (
+    "Вітаю! Як бажаєте передати товари?\n\n"
+    "🔗 Посиланнями на товар (рекомендовано - швидше і дешевше) - напишіть «так»\n"
+    "📸 Фотографіями, як зазвичай - напишіть «ні»"
+)
 
 _FIELD_LABELS = {
     "name": "назва",
@@ -509,6 +531,123 @@ async def _post_to_sales_group(bot, chat_id: int, photos: list[bytes], data: dic
         await bot.send_message(chat_id=chat_id, text=f"❌ Не вдалося додати в групу продажів: {exc}")
 
 
+async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    chat_id = update.message.chat.id
+    _chat_mode[chat_id] = "awaiting_choice"
+    _pending_url_batches.pop(chat_id, None)
+    await context.bot.send_message(chat_id=chat_id, text=_MODE_QUESTION)
+
+
+async def _identify_single_url_product(bot, chat_id: int, url: str, index: int) -> dict | None:
+    """Runs the link-mode identify -> price/discount -> images pipeline for
+    one URL, sending progress messages prefixed with its position in the
+    batch. Returns the Prom.ua row dict, or None if this URL failed -
+    callers should skip it and keep processing the rest of the batch."""
+    tag = f"[{index}]"
+
+    await bot.send_message(chat_id=chat_id, text=f"{tag} 🔍 Обробляю посилання...")
+    try:
+        data, image_urls = product_data_extractor.identify_product_from_url(url)
+    except product_data_extractor.ProductNotFoundError as exc:
+        await bot.send_message(chat_id=chat_id, text=f"{tag} ❌ Не вдалося розпізнати товар: {exc}")
+        return None
+    except Exception as exc:
+        logger.exception("Failed to process URL %s", url)
+        await bot.send_message(chat_id=chat_id, text=f"{tag} ❌ Не вдалося обробити посилання: {exc}")
+        return None
+
+    if not image_urls:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"{tag} ℹ️ На сторінці не знайдено фото товару - картка буде без зображення.",
+        )
+
+    if not data.get("price_found"):
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"{tag} ⚠️ Ціну на сторінці не знайдено - перевірте та встановіть її вручну після завантаження.",
+        )
+
+    try:
+        prom_row = product_mapper.build_prom_product(data, ", ".join(image_urls))
+    except ValueError as exc:
+        await bot.send_message(chat_id=chat_id, text=f"{tag} ❌ {exc}")
+        return None
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"{tag} ✅ «{data.get('name', '')}» - {prom_row['Ціна']} грн "
+            "(знижка 5% від ціни джерела вже враховано). Надішліть наступне посилання, або напишіть «готово»."
+        ),
+    )
+    return prom_row
+
+
+async def _handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.message.chat.id
+    text = update.message.text.strip()
+    batch = _pending_url_batches.setdefault(chat_id, {"products": [], "data_list": []})
+
+    if text.lower() in _DONE_ANSWERS:
+        products = batch["products"]
+        _pending_url_batches.pop(chat_id, None)
+        _chat_mode.pop(chat_id, None)
+        if not products:
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ Жодного товару не додано, нічого завантажувати.")
+            return
+        await _finalize_url_batch(context.bot, chat_id, products)
+        return
+
+    if not text.lower().startswith(("http://", "https://")):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ Це не схоже на посилання. Надішліть URL товару, або напишіть «готово», щоб завершити.",
+        )
+        return
+
+    index = len(batch["products"]) + 1
+    row = await _identify_single_url_product(context.bot, chat_id, text, index)
+    if row is not None:
+        batch["products"].append(row)
+
+
+async def _finalize_url_batch(bot, chat_id: int, products: list[dict]) -> None:
+    """Same tail as _process_batch: one xlsx, one Prom.ua import call for
+    the whole link-mode batch."""
+    xlsx_bytes = xlsx_builder.build_xlsx(products)
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"⬆️ Завантажую {len(products)} товар(и/ів) до Prom.ua одним запитом...",
+    )
+    try:
+        result = prom_client.import_file(xlsx_bytes)
+        logger.info("Prom.ua import result: %s", result)
+        if result.get("status") == "success" or "id" in result:
+            await bot.send_message(
+                chat_id=chat_id, text=f"✅ {len(products)} товар(и/ів) успішно передано в Пром"
+            )
+        else:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Помилка передачі на Пром: {result.get('error', '')}",
+            )
+    except prom_client.PromImportBusyError:
+        logger.warning("Prom.ua import busy after retries (likely nightly restriction)")
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⏳ Prom.ua зараз не приймає імпорт (схоже на їхнє нічне обмеження). "
+                "Це не помилка бота - спробуйте /start ще раз пізніше."
+            ),
+        )
+    except Exception as exc:
+        logger.exception("Prom.ua import failed")
+        await bot.send_message(chat_id=chat_id, text=f"❌ Помилка передачі на Пром: {exc}")
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
@@ -527,6 +666,31 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     answer = update.message.text.strip()
     answer_lower = answer.lower()
+
+    mode = _chat_mode.get(chat_id)
+    if mode == "awaiting_choice":
+        if answer_lower in _YES_ANSWERS:
+            _chat_mode[chat_id] = "url"
+            _pending_url_batches[chat_id] = {"products": [], "data_list": []}
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "🔗 Добре, надсилайте посилання на товари одне за одним (по одному в повідомленні). "
+                    "Коли завершите - напишіть «готово»."
+                ),
+            )
+        elif answer_lower in _NO_ANSWERS:
+            _chat_mode[chat_id] = "photo"
+            await context.bot.send_message(chat_id=chat_id, text="📸 Добре, надсилайте фото товарів одне за одним.")
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id, text="⚠️ Не зрозумів відповідь. Напишіть «так» або «ні»."
+            )
+        return
+
+    if mode == "url":
+        await _handle_url_message(update, context)
+        return
 
     batch = _pending_batches.get(chat_id)
     if batch and batch.get("awaiting_continue"):
@@ -599,6 +763,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     chat_id = update.message.chat.id
+
+    if _chat_mode.get(chat_id) == "url":
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ Ви обрали режим посилань. Надішліть URL товару текстом, або напишіть «готово», щоб завершити.",
+        )
+        return
+
     media_group_id = update.message.media_group_id
     logger.info("Photo received from chat %s (media_group_id=%s)", chat_id, media_group_id)
 
@@ -649,6 +821,7 @@ def main() -> None:
         return
 
     application = Application.builder().token(config.TELEGRAM_TOKEN).build()
+    application.add_handler(CommandHandler("start", handle_start))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.run_polling()

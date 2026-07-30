@@ -426,3 +426,101 @@ def extract_json(response):
     last_output = response.output[-1]
     text = last_output.content[0].text
     return json.loads(text)
+
+
+_URL_EXTRACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        # Present (non-null) only when the page itself couldn't be
+        # identified as a real product at all (error page, empty, CAPTCHA
+        # wall) - every other field is still required by strict mode but
+        # left null in that case.
+        "error": {"type": ["string", "null"]},
+        "name": {"type": ["string", "null"]},
+        "name_ru": {"type": ["string", "null"]},
+        "model": {"type": ["string", "null"]},
+        "brand": {"type": ["string", "null"]},
+        "manufacturer": {"type": ["string", "null"]},
+        "country": {"type": ["string", "null"]},
+        "material": {"type": ["string", "null"]},
+        "material_ru": {"type": ["string", "null"]},
+        "color": {"type": ["string", "null"]},
+        "color_ru": {"type": ["string", "null"]},
+        "width": {"type": ["number", "null"]},
+        "height": {"type": ["number", "null"]},
+        "length": {"type": ["number", "null"]},
+        "weight": {"type": ["number", "null"]},
+        "description": {"type": ["string", "null"]},
+        "description_ru": {"type": ["string", "null"]},
+        # Price is extracted here (verbatim, never estimated) only as a
+        # fallback for pages the reader-proxy had to render as plain text -
+        # whenever real JSON-LD is available, the caller (product_data_extractor)
+        # trusts that structured price/currency instead and ignores these.
+        "price": {"type": ["number", "null"]},
+        "price_currency": {"type": ["string", "null"]},
+        "keywords": {"type": "array", "items": {"type": "string"}},
+        "keywords_ru": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "error", "name", "name_ru", "model", "brand", "manufacturer", "country",
+        "material", "material_ru", "color", "color_ru", "width", "height",
+        "length", "weight", "description", "description_ru",
+        "price", "price_currency", "keywords", "keywords_ru",
+    ],
+    "additionalProperties": False,
+}
+
+_URL_EXTRACT_PROMPT = """Ти отримуєш дані зі сторінки КОНКРЕТНОГО товару інтернет-магазину (URL, структуровані дані JSON-LD, якщо є, і видимий текст сторінки). Це реальна сторінка товару - нічого не потрібно шукати чи підтверджувати, лише витягнути з наданих даних максимально точну інформацію та якісно локалізувати її.
+
+ПРАВИЛА:
+1. КАТЕГОРИЧНО ЗАБОРОНЕНО вигадувати дані, яких немає в наданому JSON-LD чи тексті. Якщо якась характеристика не видна в наданих даних - постав null для неї, а не здогадку.
+2. "price" і "price_currency" - витягни ТОЧНО як вказано на сторінці (число і код валюти ISO, напр. "EUR", "UAH", "BGN"). Якщо ціни немає (товар відсутній, сторінка не показує ціну) - постав null для обох. Не переводь валюту сам і не округлюй - лише те, що дослівно на сторінці.
+3. Локалізація: "name", "material", "color", "description" - українською мовою (навіть якщо оригінал іншою мовою - переклади природно, не транслітеруй). "name_ru", "material_ru", "color_ru", "description_ru" - природною грамотною російською мовою (це не буквальний переклад слово-в-слово, а те, як носій мови описав би той самий товар).
+4. Метрика: розміри в сантиметрах, вага в кілограмах. Числові значення (можна дробові через крапку).
+5. "keywords" - масив ПРИБЛИЗНО 10 унікальних українських пошукових ключових слів/фраз для картки товару на Prom.ua, релевантних саме цьому товару (тип товару, бренд, призначення, синоніми, з чим використовується). "keywords_ru" - той самий набір природною російською мовою (не буквальний переклад слово-в-слово, а те, як реально шукав би російськомовний покупець). Обидва поля обов'язкові.
+6. Якщо зі сторінки взагалі неможливо зрозуміти, що це за товар (сторінка помилки, порожня сторінка, CAPTCHA-заглушка, посилання веде не на товар) - поверни непорожній "error" з коротким поясненням українською, всі інші поля - null, а "keywords"/"keywords_ru" - порожні масиви.
+7. Стиль "description"/"description_ru": звичайний привабливий опис товару для покупця інтернет-магазину, без згадок про сам процес аналізу сторінки чи вихідне джерело (ніколи не пиши "на сторінці вказано", "судячи з даних" тощо).
+
+Поверни ВИКЛЮЧНО один JSON-об'єкт без пояснень, Markdown чи додаткового тексту."""
+
+
+def extract_product_from_page(url: str, json_ld: dict | None, page_text: str) -> dict:
+    """Link-mode counterpart to identify_product(): the product is already
+    known (the user gave its exact page), so this is pure extraction +
+    localization + keyword generation from the page's own data, not a
+    search-and-confirm loop. json_ld (schema.org Product data, when the page
+    exposed it) is included verbatim as the most trustworthy source; the
+    caller still prefers json_ld's own price/currency/images over anything
+    repeated here, since a model reading rendered text can misread digits
+    that structured data states exactly.
+    """
+    parts = [f"URL сторінки товару: {url}"]
+    if json_ld:
+        parts.append(
+            "Структуровані дані JSON-LD зі сторінки (найнадійніше джерело):\n"
+            + json.dumps(json_ld, ensure_ascii=False, indent=2)[:4000]
+        )
+    parts.append("Видимий текст сторінки:\n" + page_text)
+
+    response = _client.responses.create(
+        model=config.OPENAI_MODEL,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": _URL_EXTRACT_PROMPT},
+                    {"type": "input_text", "text": "\n\n".join(parts)},
+                ],
+            }
+        ],
+        max_output_tokens=2000,
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "product_from_url",
+                "schema": _URL_EXTRACT_SCHEMA,
+                "strict": True,
+            }
+        },
+    )
+    return extract_json(response)
