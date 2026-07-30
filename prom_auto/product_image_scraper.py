@@ -84,9 +84,10 @@ def _extract_json_ld_images(soup: BeautifulSoup) -> list[str]:
                 continue
             image = entry.get("image")
             if isinstance(image, str):
-                urls.append(image)
+                if image:
+                    urls.append(image)
             elif isinstance(image, list):
-                urls.extend(u for u in image if isinstance(u, str))
+                urls.extend(u for u in image if isinstance(u, str) and u)
     return urls
 
 

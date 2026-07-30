@@ -89,9 +89,9 @@ def _json_ld_price(json_ld: dict) -> tuple[float, str] | None:
 def _json_ld_images(json_ld: dict) -> list[str]:
     image = json_ld.get("image")
     if isinstance(image, str):
-        return [image]
+        return [image] if image else []
     if isinstance(image, list):
-        return [u for u in image if isinstance(u, str)]
+        return [u for u in image if isinstance(u, str) and u]
     return []
 
 
@@ -111,6 +111,13 @@ def _host_images(urls: list[str]) -> list[str]:
     scraped marketplace photos - the same treatment photo-mode gives its
     scraped marketplace photos. Without IMGBB_API_KEY, or if hosting fails,
     falls back to linking the source URLs directly."""
+    # Belt-and-suspenders against a blank entry reaching Telegram later (a
+    # blank "image" in a page's JSON-LD reached here once and crashed
+    # send_media_group with "Invalid file http url specified: url host is
+    # empty" - the two JSON-LD extractors are now fixed at the source too,
+    # but this is the last mile before these URLs go to Telegram).
+    urls = [u for u in urls if u and u.strip()]
+
     if not config.IMGBB_API_KEY:
         return urls
 
@@ -134,10 +141,18 @@ def _host_images(urls: list[str]) -> list[str]:
 def identify_product_from_url(url: str) -> tuple[dict, list[str]]:
     """Link-mode pipeline: fetch the page, extract structured (JSON-LD) data
     when present, ask OpenAI to translate/localize/generate keywords from
-    it, resolve the final UAH price (code-driven currency conversion plus
-    the automatic DISCOUNT_RATE, never model arithmetic), and gather product
-    images. Returns (data, image_urls), where `data` matches the schema
-    product_mapper.build_prom_product() expects.
+    it, resolve the source price in UAH (code-driven currency conversion,
+    never model arithmetic), and gather product images. Returns (data,
+    image_urls), where `data` matches the schema product_mapper.
+    build_prom_product() expects.
+
+    priceUAH is the real, undiscounted source price - DISCOUNT_RATE is
+    *not* baked into it. Prom.ua has its own native price/discount
+    mechanism (POST /products/edit's `discount` field), which computes and
+    displays the reduced price itself; pre-multiplying it away here would
+    just hide the real source price from Prom.ua and from anyone auditing
+    the number. See telegram_bot._apply_link_mode_discounts, which applies
+    DISCOUNT_RATE through that API after the product is created.
 
     Raises ProductNotFoundError if the page isn't recognizable as a real
     product.
@@ -157,10 +172,9 @@ def identify_product_from_url(url: str) -> tuple[dict, list[str]]:
     price_found = price_info is not None
     if price_found:
         amount, currency = price_info
-        base_uah = convert_to_uah(amount, currency)
-        final_price = round(base_uah * (1 - DISCOUNT_RATE), 2)
+        source_price_uah = round(convert_to_uah(amount, currency), 2)
     else:
-        final_price = 0
+        source_price_uah = 0
 
     data = {
         "name": enriched.get("name"),
@@ -179,7 +193,7 @@ def identify_product_from_url(url: str) -> tuple[dict, list[str]]:
         "weight": enriched.get("weight"),
         "description": enriched.get("description"),
         "description_ru": enriched.get("description_ru"),
-        "priceUAH": final_price,
+        "priceUAH": source_price_uah,
         "price_found": price_found,
         "keywords": enriched.get("keywords") or [],
         "keywords_ru": enriched.get("keywords_ru") or [],

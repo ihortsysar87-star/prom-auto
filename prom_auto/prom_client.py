@@ -161,6 +161,64 @@ def get_import_status(import_id: str) -> dict:
     return response.json()
 
 
+def get_product_by_external_id(external_id: str) -> dict | None:
+    """GET /products/by_external_id/{id} - looks a product up by the
+    external_id/sku we gave it (our "vNNNN" article), returning Prom.ua's
+    own numeric product id and its current price/discount/etc. Returns None
+    if Prom.ua has no product under that external_id (e.g. the xlsx import
+    never actually created/updated it, despite an apparently successful
+    upload)."""
+    response = requests.get(
+        f"{config.PROM_API_BASE_URL}/products/by_external_id/{external_id}",
+        headers=_HEADERS,
+        timeout=15,
+    )
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    return response.json().get("product")
+
+
+def edit_products(edits: list[dict]) -> dict:
+    """POST /products/edit - batched edits keyed by Prom.ua's own numeric
+    product id (not external_id/sku). Used to set a native price/discount
+    (the `discount` field: {value, type: "percent"|"amount"}) so Prom.ua
+    computes and displays the reduced price itself, instead of the bot
+    pre-multiplying the price and hiding the real source price. Returns
+    {"processed_ids": [...], "errors": {...}}."""
+    response = requests.post(
+        f"{config.PROM_API_BASE_URL}/products/edit",
+        headers=_HEADERS,
+        json=edits,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _import_status_is_settled(status_payload: dict) -> bool:
+    """Whether an ImportStatus response actually reflects a finished job,
+    not just a terminal-looking `status` value. Confirmed in practice:
+    Prom.ua can report status="SUCCESS" on the very first poll while every
+    count (created/updated/not_changed/actualized/with_errors_count) is
+    still 0 for a file with a non-zero `total` - i.e. the file was accepted
+    but nothing had actually been processed yet. Trusting `status` alone
+    there made the bot declare success for an import that (as far as we
+    could tell) did nothing. If total rows were submitted, treat it as
+    settled only once *some* count shows the job actually did something."""
+    status = str(status_payload.get("status", "")).lower()
+    if status not in _IMPORT_TERMINAL_STATUSES:
+        return False
+    total = status_payload.get("total") or 0
+    if total == 0:
+        return True
+    progress = sum(
+        status_payload.get(key) or 0
+        for key in ("created", "updated", "not_changed", "actualized", "imported", "with_errors_count")
+    )
+    return progress > 0
+
+
 def import_and_wait(xlsx_bytes: bytes) -> dict:
     """Uploads the file via import_file(), then polls get_import_status()
     until Prom.ua's async job actually finishes. import_file()'s own
@@ -168,11 +226,12 @@ def import_and_wait(xlsx_bytes: bytes) -> dict:
     clear that stage and still have every row silently rejected during
     processing (bad price, missing category, etc.), with no other signal
     unless something calls this status endpoint. Returns the final
-    ImportStatus payload.
+    ImportStatus payload (with the job id added back in as "import_id",
+    since Prom.ua's status response itself doesn't echo it).
 
     Raises PromImportStillProcessingError if the job hasn't reached a
-    terminal status within the poll budget - the import may still complete
-    later, this just means we stopped waiting for it.
+    genuinely settled status within the poll budget - the import may still
+    complete later, this just means we stopped waiting for it.
     """
     posted = import_file(xlsx_bytes)
     import_id = posted.get("id")
@@ -185,16 +244,19 @@ def import_and_wait(xlsx_bytes: bytes) -> dict:
     for attempt in range(1, _IMPORT_STATUS_MAX_POLLS + 1):
         time.sleep(_IMPORT_STATUS_POLL_SECONDS)
         last_status = get_import_status(import_id)
-        if str(last_status.get("status", "")).lower() in _IMPORT_TERMINAL_STATUSES:
+        if _import_status_is_settled(last_status):
+            last_status["import_id"] = import_id
             return last_status
         logger.info(
-            "Prom.ua import %s still processing (poll %d/%d): %s",
+            "Prom.ua import %s not settled yet (poll %d/%d): %s",
             import_id,
             attempt,
             _IMPORT_STATUS_MAX_POLLS,
             last_status,
         )
 
+    if last_status is not None:
+        last_status["import_id"] = import_id
     raise PromImportStillProcessingError(
-        f"Prom.ua import {import_id} did not finish within the poll budget", last_status
+        f"Prom.ua import {import_id} did not settle within the poll budget", last_status
     )

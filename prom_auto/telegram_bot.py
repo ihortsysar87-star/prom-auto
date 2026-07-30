@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import urllib.parse
@@ -58,7 +59,22 @@ _pending_price_requests: dict[int, dict] = {}
 # requirement, for either flow.
 _chat_mode: dict[int, str] = {}
 
-# chat_id -> {"products": list[dict], "data_list": list[tuple[list[str], dict]]}.
+# chat_id -> {
+#   "products": list[dict],                  finalized Prom.ua rows, queued
+#                                             for _finalize_url_batch
+#   "data_list": list[tuple[list[str], dict]], (image_urls, data) pairs
+#                                             parallel to "products"
+#   "pending": dict | None,                  the URL currently being
+#                                             wizard-ed through price/photo
+#                                             questions before it's added to
+#                                             "products" - see
+#                                             _start_pending_item. Only one
+#                                             URL is ever mid-wizard at a
+#                                             time; while it's set, incoming
+#                                             text/photos route to it
+#                                             instead of being treated as a
+#                                             new URL or batch answer.
+# }
 # Link-mode's equivalent of _pending_batches: one entry per successfully
 # identified URL, collected until the user sends a _DONE_ANSWERS reply.
 _pending_url_batches: dict[int, dict] = {}
@@ -474,20 +490,35 @@ async def _report_import_result(bot, chat_id: int, status_payload: dict, total: 
     prom_status = str(status_payload.get("status", "")).upper()
     created = status_payload.get("created", 0)
     updated = status_payload.get("updated", 0)
+    not_changed = status_payload.get("not_changed", 0)
+    actualized = status_payload.get("actualized", 0)
     with_errors = status_payload.get("with_errors_count", 0)
+    progressed = created or updated or not_changed or actualized
 
-    if prom_status == "SUCCESS" and not with_errors:
+    if prom_status == "SUCCESS" and not with_errors and (progressed or total == 0):
         await bot.send_message(
             chat_id=chat_id,
             text=f"✅ {total} товар(и/ів) успішно передано в Пром (створено: {created}, оновлено: {updated})",
         )
-    else:
+    elif with_errors:
         details = _format_import_errors(status_payload.get("errors"))
         await bot.send_message(
             chat_id=chat_id,
             text=(
                 f"⚠️ Prom.ua обробив імпорт, але {with_errors} з {total} товар(и/ів) НЕ додано "
                 f"(створено: {created}, оновлено: {updated}). Деталі: {details}"
+            ),
+        )
+    else:
+        # Prom.ua reported no errors at all, yet nothing was created,
+        # updated, or left unchanged either - a real anomaly we've seen it
+        # do (status SUCCESS with every count at 0), not a normal outcome.
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚠️ Prom.ua повідомив статус «{prom_status}» без помилок, але жодного товару "
+                f"не створено й не оновлено (з {total}) - перевірте кабінет вручну, "
+                "це схоже на затримку/збій на боці Prom.ua, а не на помилку бота."
             ),
         )
 
@@ -620,13 +651,14 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await context.bot.send_message(chat_id=chat_id, text=_MODE_QUESTION)
 
 
-async def _identify_single_url_product(
-    bot, chat_id: int, url: str, index: int
-) -> tuple[dict, dict, list[str]] | None:
-    """Runs the link-mode identify -> price/discount -> images pipeline for
-    one URL, sending progress messages prefixed with its position in the
-    batch. Returns (prom_row, data, image_urls), or None if this URL failed -
-    callers should skip it and keep processing the rest of the batch."""
+async def _fetch_url_product(bot, chat_id: int, url: str, index: int) -> tuple[dict, list[str]] | None:
+    """Runs just the link-mode identify step for one URL (fetch -> OpenAI
+    extraction -> price/images), sending progress messages prefixed with
+    its position in the batch. Returns (data, image_urls) - the scraped
+    images, not yet finalized into a Prom.ua row - or None if this URL
+    failed, in which case callers should skip it and keep processing the
+    rest of the batch. Price/photo-source questions happen afterward, in
+    _start_pending_item."""
     tag = f"[{index}]"
 
     await bot.send_message(chat_id=chat_id, text=f"{tag} 🔍 Обробляю посилання...")
@@ -640,38 +672,184 @@ async def _identify_single_url_product(
         await bot.send_message(chat_id=chat_id, text=f"{tag} ❌ Не вдалося обробити посилання: {exc}")
         return None
 
+    return data, image_urls
+
+
+async def _start_pending_item(
+    bot, chat_id: int, batch: dict, data: dict, image_urls: list[str], index: int
+) -> None:
+    """Kicks off the short wizard for one just-identified URL: ask for a
+    manual price if the source page didn't have one, then ask whether to
+    use the user's own photos instead of the scraped ones. Nothing is added
+    to batch["products"] until _finalize_pending_item runs at the end of
+    this - see the "pending" key's docstring on _pending_url_batches."""
+    batch["pending"] = {
+        "stage": None,
+        "data": data,
+        "image_urls": image_urls,
+        "index": index,
+        "own_photos": [],
+        "photo_job": None,
+    }
+    tag = f"[{index}]"
+    if not data.get("price_found"):
+        batch["pending"]["stage"] = "price"
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"{tag} ⚠️ Ціну на сторінці не знайдено. Введіть ціну вручну (в грн):",
+        )
+    else:
+        await _ask_photo_choice(bot, chat_id, batch)
+
+
+async def _ask_photo_choice(bot, chat_id: int, batch: dict) -> None:
+    pending = batch["pending"]
+    pending["stage"] = "photo_choice"
+    tag = f"[{pending['index']}]"
+    count = len(pending["image_urls"])
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"{tag} 📷 Знайдено {count} фото на сайті. Бажаєте надіслати власні фото замість них? "
+            "Напишіть «так» і надішліть фото, або «ні» - щоб залишити фото сайту."
+        ),
+    )
+
+
+async def _finalize_pending_item(bot, chat_id: int, batch: dict) -> None:
+    """Builds the Prom.ua row for the item batch["pending"] describes (own
+    photos if the user sent any, otherwise the scraped ones) and appends it
+    to the batch, same as the old single-shot _identify_single_url_product
+    used to do directly."""
+    pending = batch.pop("pending")
+    data = pending["data"]
+    index = pending["index"]
+    tag = f"[{index}]"
+
+    if pending["own_photos"]:
+        try:
+            image_urls = [image_host.upload_image(photo) for photo in pending["own_photos"]]
+        except Exception as exc:
+            logger.exception("Failed to upload own photos for link-mode product")
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"{tag} ❌ Не вдалося завантажити власні фото: {exc}. Використовую фото сайту.",
+            )
+            image_urls = pending["image_urls"]
+    else:
+        image_urls = pending["image_urls"]
+
     if not image_urls:
         await bot.send_message(
-            chat_id=chat_id,
-            text=f"{tag} ℹ️ На сторінці не знайдено фото товару - картка буде без зображення.",
-        )
-
-    if not data.get("price_found"):
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"{tag} ⚠️ Ціну на сторінці не знайдено - перевірте та встановіть її вручну після завантаження.",
+            chat_id=chat_id, text=f"{tag} ℹ️ Фото немає - картка буде без зображення."
         )
 
     try:
         prom_row = product_mapper.build_prom_product(data, ", ".join(image_urls))
     except ValueError as exc:
         await bot.send_message(chat_id=chat_id, text=f"{tag} ❌ {exc}")
-        return None
+        return
 
+    # A manually-typed price is already the final store price, not a
+    # source price to discount from - Prom.ua's own discount (applied in
+    # _apply_link_mode_discounts) is skipped for these.
+    if data.get("manual_price"):
+        price_note = "ціну встановлено вручну"
+    else:
+        price_note = (
+            f"ціна з сайту-джерела (знижку {product_data_extractor.DISCOUNT_RATE:.0%} "
+            "застосує сам Prom.ua після завантаження)"
+        )
     await bot.send_message(
         chat_id=chat_id,
         text=(
-            f"{tag} ✅ «{data.get('name', '')}» - {prom_row['Ціна']} грн "
-            "(знижка 5% від ціни джерела вже враховано). Надішліть наступне посилання, або напишіть «ні»."
+            f"{tag} ✅ «{data.get('name', '')}» - {prom_row['Ціна']} грн ({price_note}). "
+            "Надішліть наступне посилання, або напишіть «ні»."
         ),
     )
-    return prom_row, data, image_urls
+    batch["products"].append(prom_row)
+    batch["data_list"].append((image_urls, data))
+
+
+async def _handle_url_pending_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, batch: dict, pending: dict
+) -> None:
+    """Routes a text message to whichever question _start_pending_item's
+    wizard is currently waiting on for this chat's in-progress URL."""
+    chat_id = update.message.chat.id
+    text = update.message.text.strip()
+    answer_lower = text.lower()
+    stage = pending["stage"]
+    tag = f"[{pending['index']}]"
+
+    if stage == "price":
+        try:
+            price = float(text.replace(",", "."))
+        except ValueError:
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"{tag} ⚠️ Напишіть ціну числом (наприклад 350), в грн."
+            )
+            return
+        pending["data"]["priceUAH"] = price
+        pending["data"]["price_found"] = True
+        pending["data"]["manual_price"] = True
+        await context.bot.send_message(chat_id=chat_id, text=f"{tag} ✅ Ціну встановлено: {price:.0f} грн")
+        await _ask_photo_choice(context.bot, chat_id, batch)
+        return
+
+    if stage == "photo_choice":
+        if answer_lower in _YES_ANSWERS:
+            pending["stage"] = "own_photos"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"{tag} 📸 Надішліть фото товару (одне або декілька). Коли завершите надсилати - "
+                    "я продовжу автоматично."
+                ),
+            )
+        else:
+            await _finalize_pending_item(context.bot, chat_id, batch)
+        return
+
+    if stage == "own_photos":
+        if answer_lower in _NO_ANSWERS:
+            if pending.get("photo_job") is not None:
+                pending["photo_job"].schedule_removal()
+                pending["photo_job"] = None
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"{tag} ↩️ Скасовано, використовую фото сайту."
+            )
+            await _finalize_pending_item(context.bot, chat_id, batch)
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"{tag} 📸 Надішліть фото товару, або напишіть «ні», щоб використати фото сайту.",
+            )
+        return
+
+
+async def _finalize_own_photos_group(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Debounce companion to handle_photo's own-photos branch, mirroring
+    _finalize_current_group's role for photo mode: fires once no new photo
+    has arrived for ALBUM_COLLECT_DELAY seconds, treating the batch of
+    photos received since as complete."""
+    chat_id = context.job.data
+    batch = _pending_url_batches.get(chat_id)
+    pending = batch.get("pending") if batch else None
+    if not pending or pending["stage"] != "own_photos":
+        return
+    pending["photo_job"] = None
+    await _finalize_pending_item(context.bot, chat_id, batch)
 
 
 async def _handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat.id
     text = update.message.text.strip()
-    batch = _pending_url_batches.setdefault(chat_id, {"products": [], "data_list": []})
+    batch = _pending_url_batches.setdefault(chat_id, {"products": [], "data_list": [], "pending": None})
+
+    if batch.get("pending"):
+        await _handle_url_pending_text(update, context, batch, batch["pending"])
+        return
 
     if text.lower() in _DONE_ANSWERS:
         products = batch["products"]
@@ -693,11 +871,90 @@ async def _handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     index = len(batch["products"]) + 1
-    result = await _identify_single_url_product(context.bot, chat_id, url, index)
+    result = await _fetch_url_product(context.bot, chat_id, url, index)
     if result is not None:
-        row, data, image_urls = result
-        batch["products"].append(row)
-        batch["data_list"].append((image_urls, data))
+        data, image_urls = result
+        await _start_pending_item(context.bot, chat_id, batch, data, image_urls, index)
+
+
+async def _apply_link_mode_discounts(
+    bot, chat_id: int, products: list[dict], data_list: list[tuple[list[str], dict]]
+) -> None:
+    """Link-mode's automatic discount is applied through Prom.ua's own
+    price/discount mechanism (POST /products/edit's `discount` field)
+    instead of being pre-multiplied into the xlsx-imported price - Prom.ua
+    then computes and displays the reduced price itself, rather than the
+    bot doing that arithmetic client-side and hiding the real source price.
+
+    Runs after the import is confirmed settled. Each product is looked back
+    up by the article (external_id) we gave it, since that's how we find
+    Prom.ua's own numeric id, which /products/edit keys on rather than
+    external_id - a short retry covers the case where the product isn't
+    queryable yet immediately after the import settles.
+
+    Products whose price was typed in manually (data["manual_price"]) are
+    skipped - that's already the final store price the user chose, not a
+    source price Prom.ua should knock a further discount off of.
+    """
+    manual_articles = {
+        product["Ідентифікатор_товару"]
+        for product, (_image_urls, data) in zip(products, data_list)
+        if data.get("manual_price")
+    }
+
+    edits = []
+    missing = []
+    for product in products:
+        article = product["Ідентифікатор_товару"]
+        if article in manual_articles:
+            continue
+        prom_product = None
+        for attempt in range(2):
+            try:
+                prom_product = prom_client.get_product_by_external_id(article)
+            except Exception:
+                logger.exception("Failed to look up product %s for discount", article)
+                break
+            if prom_product is not None or attempt == 1:
+                break
+            await asyncio.sleep(3)
+        if prom_product is None:
+            missing.append(article)
+            continue
+        edits.append(
+            {
+                "id": prom_product["id"],
+                "discount": {
+                    "value": product_data_extractor.DISCOUNT_RATE * 100,
+                    "type": "percent",
+                },
+            }
+        )
+
+    if not edits:
+        if missing:
+            logger.warning("No products found in Prom.ua to apply discount to: %s", missing)
+        return
+
+    try:
+        result = prom_client.edit_products(edits)
+        logger.info("Prom.ua discount edit result: %s", result)
+        applied = len(result.get("processed_ids") or [])
+        errors = result.get("errors") or {}
+        text = (
+            f"🏷️ Знижку {product_data_extractor.DISCOUNT_RATE:.0%} застосовано через Prom.ua "
+            f"до {applied} з {len(edits)} товар(и/ів)."
+        )
+        if errors:
+            text += f" Помилки: {errors}"
+        if missing:
+            text += f" Не знайдено в Prom.ua для встановлення знижки: {', '.join(missing)}."
+        await bot.send_message(chat_id=chat_id, text=text)
+    except Exception as exc:
+        logger.exception("Failed to apply Prom.ua discount")
+        await bot.send_message(
+            chat_id=chat_id, text=f"⚠️ Не вдалося застосувати знижку через Prom.ua API: {exc}"
+        )
 
 
 async def _finalize_url_batch(
@@ -714,6 +971,7 @@ async def _finalize_url_batch(
         status_payload = prom_client.import_and_wait(xlsx_bytes)
         logger.info("Prom.ua import status: %s", status_payload)
         await _report_import_result(bot, chat_id, status_payload, len(products))
+        await _apply_link_mode_discounts(bot, chat_id, products, data_list)
     except prom_client.PromImportBusyError:
         logger.warning("Prom.ua import busy after retries (likely nightly restriction)")
         await bot.send_message(
@@ -770,12 +1028,13 @@ async def _ask_next_group_confirmation(bot, chat_id: int) -> None:
             )
             continue
         state["awaiting"] = True
+        price_source = "ціна встановлена вручну" if data.get("manual_price") else "ціна з сайту-джерела"
         await bot.send_message(
             chat_id=chat_id,
             text=(
                 f"💬 Додати «{data.get('name', '')}» в групу продажів за {data['priceUAH']:.0f} грн "
-                "(ціна з сайту-джерела, знижка 5% вже враховано)? "
-                "Будь-яка відповідь = так, для відмови напишіть «ні»."
+                f"({price_source})? Напишіть іншу ціну, щоб змінити її для групи, "
+                "будь-яку іншу відповідь - щоб підтвердити цю ціну, або «ні» - щоб пропустити."
             ),
         )
         return
@@ -805,7 +1064,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if mode == "awaiting_choice":
         if answer_lower in _YES_ANSWERS:
             _chat_mode[chat_id] = "url"
-            _pending_url_batches[chat_id] = {"products": [], "data_list": []}
+            _pending_url_batches[chat_id] = {"products": [], "data_list": [], "pending": None}
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
@@ -848,7 +1107,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # shouldn't have to run /start just to paste a link.
     if mode is None and not batch and _extract_url(answer) is not None:
         _chat_mode[chat_id] = "url"
-        _pending_url_batches[chat_id] = {"products": [], "data_list": []}
+        _pending_url_batches[chat_id] = {"products": [], "data_list": [], "pending": None}
         await _handle_url_message(update, context)
         return
 
@@ -856,7 +1115,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if group_state and group_state.get("awaiting"):
         # No strict так/ні matching here on purpose - any reply confirms
         # ("додати" is the default action), and only an explicit "ні"/"no"
-        # declines. Anything typed is treated as intent to add.
+        # declines. A reply that parses as a number overrides the suggested
+        # source price for this group post specifically (Prom.ua's own
+        # price/discount is untouched); anything else just confirms the
+        # suggested price as-is.
         image_urls, data = group_state["queue"].pop(0)
         group_state["awaiting"] = False
         if answer_lower in _NO_ANSWERS:
@@ -864,7 +1126,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 chat_id=chat_id, text=f"⏭️ Пропущено «{data.get('name', '')}», не додано в групу продажів"
             )
         else:
-            await _post_to_sales_group(context.bot, chat_id, image_urls, data, data["priceUAH"])
+            try:
+                price = float(answer.replace(",", "."))
+            except ValueError:
+                price = data["priceUAH"]
+            await _post_to_sales_group(context.bot, chat_id, image_urls, data, price)
         await _ask_next_group_confirmation(context.bot, chat_id)
         return
 
@@ -926,6 +1192,19 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = update.message.chat.id
 
     if _chat_mode.get(chat_id) == "url":
+        url_batch = _pending_url_batches.get(chat_id)
+        pending = url_batch.get("pending") if url_batch else None
+        if pending and pending["stage"] == "own_photos":
+            photo = update.message.photo[-1]
+            photo_file = await photo.get_file()
+            image_bytes = bytes(await photo_file.download_as_bytearray())
+            pending["own_photos"].append(image_bytes)
+            if pending["photo_job"] is not None:
+                pending["photo_job"].schedule_removal()
+            pending["photo_job"] = context.job_queue.run_once(
+                _finalize_own_photos_group, ALBUM_COLLECT_DELAY, data=chat_id
+            )
+            return
         await context.bot.send_message(
             chat_id=chat_id,
             text="⚠️ Ви обрали режим посилань. Надішліть URL товару текстом, або напишіть «ні», щоб завершити.",
