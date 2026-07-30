@@ -77,7 +77,10 @@ _YES_ANSWERS = {"так", "да", "yes", "y"}
 _NO_ANSWERS = {"ні", "ни", "нет", "no", "n"}
 
 # Marks the end of a link-mode batch (user has no more URLs to send).
-_DONE_ANSWERS = {"готово", "стоп", "done", "кінець", "закінчити"}
+# "ні" ("no [more links]") is the advertised answer, kept simple and
+# consistent with the yes/no language used elsewhere in the bot; the rest
+# stay valid too so older habits still work.
+_DONE_ANSWERS = _NO_ANSWERS | {"готово", "стоп", "done", "кінець", "закінчити"}
 
 # Matches many "share" formats apps produce (e.g. eMag's share sheet sends
 # "<url> <page title> - eMAG.hu" as one message): grabs just the URL token,
@@ -615,7 +618,7 @@ async def _identify_single_url_product(
         chat_id=chat_id,
         text=(
             f"{tag} ✅ «{data.get('name', '')}» - {prom_row['Ціна']} грн "
-            "(знижка 5% від ціни джерела вже враховано). Надішліть наступне посилання, або напишіть «готово»."
+            "(знижка 5% від ціни джерела вже враховано). Надішліть наступне посилання, або напишіть «ні»."
         ),
     )
     return prom_row, data, image_urls
@@ -641,7 +644,7 @@ async def _handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if url is None:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="⚠️ Це не схоже на посилання. Надішліть URL товару, або напишіть «готово», щоб завершити.",
+            text="⚠️ Це не схоже на посилання. Надішліть URL товару, або напишіть «ні», щоб завершити.",
         )
         return
 
@@ -762,7 +765,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 chat_id=chat_id,
                 text=(
                     "🔗 Добре, надсилайте посилання на товари одне за одним (по одному в повідомленні). "
-                    "Коли завершите - напишіть «готово»."
+                    "Коли завершите - напишіть «ні»."
                 ),
             )
         elif answer_lower in _NO_ANSWERS:
@@ -880,7 +883,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if _chat_mode.get(chat_id) == "url":
         await context.bot.send_message(
             chat_id=chat_id,
-            text="⚠️ Ви обрали режим посилань. Надішліть URL товару текстом, або напишіть «готово», щоб завершити.",
+            text="⚠️ Ви обрали режим посилань. Надішліть URL товару текстом, або напишіть «ні», щоб завершити.",
         )
         return
 
