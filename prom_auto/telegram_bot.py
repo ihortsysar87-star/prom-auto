@@ -1,4 +1,8 @@
+from __future__ import annotations
+
 import asyncio
+import calendar
+import datetime
 import logging
 import re
 import urllib.parse
@@ -877,6 +881,17 @@ async def _handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _start_pending_item(context.bot, chat_id, batch, data, image_urls, index)
 
 
+def _one_month_from(d: datetime.date) -> datetime.date:
+    """d plus one calendar month, clamped to the target month's last valid
+    day (e.g. 31.01 -> 28/29.02) rather than overflowing into the month
+    after."""
+    month = d.month + 1
+    year = d.year + (month - 1) // 12
+    month = (month - 1) % 12 + 1
+    last_day = calendar.monthrange(year, month)[1]
+    return d.replace(year=year, month=month, day=min(d.day, last_day))
+
+
 async def _apply_link_mode_discounts(
     bot, chat_id: int, products: list[dict], data_list: list[tuple[list[str], dict]]
 ) -> None:
@@ -921,12 +936,15 @@ async def _apply_link_mode_discounts(
         if prom_product is None:
             missing.append(article)
             continue
+        today = datetime.date.today()
         edits.append(
             {
                 "id": prom_product["id"],
                 "discount": {
                     "value": product_data_extractor.DISCOUNT_RATE * 100,
                     "type": "percent",
+                    "date_start": today.strftime("%d.%m.%Y"),
+                    "date_end": _one_month_from(today).strftime("%d.%m.%Y"),
                 },
             }
         )
@@ -941,9 +959,10 @@ async def _apply_link_mode_discounts(
         logger.info("Prom.ua discount edit result: %s", result)
         applied = len(result.get("processed_ids") or [])
         errors = result.get("errors") or {}
+        period = edits[0]["discount"]
         text = (
             f"🏷️ Знижку {product_data_extractor.DISCOUNT_RATE:.0%} застосовано через Prom.ua "
-            f"до {applied} з {len(edits)} товар(и/ів)."
+            f"до {applied} з {len(edits)} товар(и/ів) на період {period['date_start']}–{period['date_end']}."
         )
         if errors:
             text += f" Помилки: {errors}"
