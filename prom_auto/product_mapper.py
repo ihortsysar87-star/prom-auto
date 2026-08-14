@@ -1,4 +1,29 @@
-from . import article_counter, config
+from . import article_counter, config, xlsx_builder
+
+_CHARACTERISTIC_UNITS = {"Ширина": "см", "Висота": "см", "Довжина": "см", "Вага": "кг"}
+
+
+def build_characteristics(data: dict) -> list[tuple[str, str, object]]:
+    """Builds Prom.ua's structured (name, unit, value) characteristic
+    triples (see xlsx_builder) from the same brand/model/material/color/
+    dimensions fields build_prom_product() also bakes into the free-text
+    description. Exposed separately so rozetka_backfill.py can produce the
+    same triples for products that already exist on Prom.ua, without
+    rebuilding a whole product row for them."""
+    return [
+        (label, _CHARACTERISTIC_UNITS.get(label, ""), value)
+        for label, value in (
+            ("Бренд", data.get("brand")),
+            ("Модель", data.get("model")),
+            ("Матеріал", data.get("material")),
+            ("Колір", data.get("color")),
+            ("Ширина", data.get("width")),
+            ("Висота", data.get("height")),
+            ("Довжина", data.get("length")),
+            ("Вага", data.get("weight")),
+        )
+        if value and value != "null"
+    ]
 
 
 def build_prom_product(data: dict, image_url: str) -> dict:
@@ -11,28 +36,18 @@ def build_prom_product(data: dict, image_url: str) -> dict:
         raise ValueError("Товар не знайдено")
 
     article = article_counter.next_article()
+    external_id = article_counter.external_id_for(article)
     keywords = data.get("keywords") or []
     all_keywords = ", ".join(keywords) if isinstance(keywords, list) else ""
     keywords_ru = data.get("keywords_ru") or keywords
     all_keywords_ru = ", ".join(keywords_ru) if isinstance(keywords_ru, list) else ""
 
-    specs = [
-        ("Бренд", data.get("brand")),
-        ("Модель", data.get("model")),
-        ("Матеріал", data.get("material")),
-        ("Колір", data.get("color")),
-        ("Ширина", data.get("width")),
-        ("Висота", data.get("height")),
-        ("Довжина", data.get("length")),
-        ("Вага", data.get("weight")),
-    ]
+    characteristics = build_characteristics(data)
     # Prom.ua's description field is rich-text/HTML, not plain text - a bare
     # "\n" gets collapsed by normal HTML whitespace rules and renders as no
     # break at all, running the description and characteristics together
     # into one unbroken line. <br> is required for an actual visible break.
-    specifications = "".join(
-        f"- {label}: {value};<br>" for label, value in specs if value and value != "null"
-    )
+    specifications = "".join(f"- {label}: {value};<br>" for label, unit, value in characteristics)
     description = f"{data.get('description', '')}<br><br>Характеристики:<br>{specifications}"
     name = " ".join(part for part in (data.get("name"), data.get("brand")) if part).strip()
 
@@ -67,7 +82,7 @@ def build_prom_product(data: dict, image_url: str) -> dict:
     ).strip()
 
     return {
-        "Ідентифікатор_товару": article,
+        "Ідентифікатор_товару": external_id,
         "Код_товару": article,
         "Назва_позиції": name_ru,
         "Назва_позиції_укр": name,
@@ -95,4 +110,5 @@ def build_prom_product(data: dict, image_url: str) -> dict:
         "Де_знаходиться_товар": config.PROM_REGION,
         "Пошукові_запити": all_keywords_ru,
         "Пошукові_запити_укр": all_keywords,
+        xlsx_builder.CHARACTERISTICS_KEY: characteristics,
     }

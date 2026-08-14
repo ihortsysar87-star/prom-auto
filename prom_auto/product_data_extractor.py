@@ -165,7 +165,30 @@ def identify_product_from_url(url: str) -> tuple[dict, list[str]]:
     product.
     """
     html, is_html = page_fetch.fetch_html(url)
-    json_ld = _extract_json_ld_product(html) if is_html else None
+    return identify_product_from_html(url, html, is_html)
+
+
+def identify_product_from_html(
+    url: str,
+    html: str,
+    is_html: bool,
+    image_urls: list[str] | None = None,
+    json_ld: dict | None = None,
+) -> tuple[dict, list[str]]:
+    """Same extraction/localization/pricing as identify_product_from_url,
+    but for a page already fetched by some other means - e.g. a real
+    browser session for a site whose Cloudflare challenge blocks both the
+    direct fetch and page_fetch's reader-proxy fallback (confirmed on
+    several marketplaces, not just Rozetka).
+
+    image_urls, when given, is used as-is (still hosted/quality-checked by
+    _host_images) instead of product_image_scraper's own requests.get - that
+    scraper would hit the exact same block a plain fetch does. json_ld,
+    when given, likewise skips re-deriving it from `html` (e.g. already
+    parsed client-side in a browser session that rendered the page).
+    """
+    if json_ld is None:
+        json_ld = _extract_json_ld_product(html) if is_html else None
     page_text = _visible_text(html) if is_html else html[:PAGE_TEXT_MAX_CHARS]
 
     enriched = openai_client.extract_product_from_page(url, json_ld, page_text)
@@ -206,6 +229,40 @@ def identify_product_from_url(url: str) -> tuple[dict, list[str]]:
         "keywords_ru": enriched.get("keywords_ru") or [],
     }
 
-    image_urls = _host_images(_gather_image_urls(url, json_ld))
+    if image_urls is None:
+        image_urls = _gather_image_urls(url, json_ld)
+    hosted_image_urls = _host_images(image_urls)
 
-    return data, image_urls
+    return data, hosted_image_urls
+
+
+def extract_characteristics_from_url(url: str) -> dict:
+    """Backfill counterpart to identify_product_from_url(): re-derives just
+    the structured attributes (brand, manufacturer, material, color,
+    dimensions) an already-published Prom.ua listing's own page never had
+    extracted as Prom.ua "characteristics" (see product_mapper.
+    build_characteristics), by reading that same live listing page again.
+
+    Deliberately ignores price/images/keywords/description from the
+    extraction - a backfill of an already-live product must never touch
+    those, only fill in the missing characteristics/vendor fields.
+    """
+    html, is_html = page_fetch.fetch_html(url)
+    json_ld = _extract_json_ld_product(html) if is_html else None
+    page_text = _visible_text(html) if is_html else html[:PAGE_TEXT_MAX_CHARS]
+
+    enriched = openai_client.extract_product_from_page(url, json_ld, page_text)
+    if enriched.get("error"):
+        raise ProductNotFoundError(enriched["error"])
+
+    return {
+        "brand": enriched.get("brand"),
+        "manufacturer": enriched.get("manufacturer"),
+        "country": enriched.get("country"),
+        "material": enriched.get("material"),
+        "color": enriched.get("color"),
+        "width": enriched.get("width"),
+        "height": enriched.get("height"),
+        "length": enriched.get("length"),
+        "weight": enriched.get("weight"),
+    }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from typing import Iterator
 
 import requests
 
@@ -75,6 +76,32 @@ def count_products() -> int:
             break
         last_id = min(p["id"] for p in products) - 1
     return total
+
+
+def list_products() -> Iterator[dict]:
+    """Pages through GET /products/list (same last_id-based pagination as
+    count_products) yielding each product's full dict - for callers (e.g.
+    olx_sync) that need the actual product data, not just a count."""
+    last_id = None
+    page_size = 100
+    while True:
+        params = {"limit": page_size}
+        if last_id is not None:
+            params["last_id"] = last_id
+        response = requests.get(
+            f"{config.PROM_API_BASE_URL}/products/list",
+            headers=_HEADERS,
+            params=params,
+            timeout=30,
+        )
+        response.raise_for_status()
+        products = response.json().get("products", [])
+        if not products:
+            break
+        yield from products
+        if len(products) < page_size:
+            break
+        last_id = min(p["id"] for p in products) - 1
 
 
 _ARTICLE_PATTERN = re.compile(r"^v(\d+)$", re.IGNORECASE)
@@ -172,6 +199,24 @@ def get_product_by_external_id(external_id: str) -> dict | None:
     upload)."""
     response = requests.get(
         f"{config.PROM_API_BASE_URL}/products/by_external_id/{external_id}",
+        headers=_HEADERS,
+        timeout=15,
+    )
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    return response.json().get("product")
+
+
+def get_product(product_id: int) -> dict | None:
+    """GET /products/{id} - a single product's current live data (name,
+    price, currency, presence, status, external_id, ...). Used before a
+    backfill re-import to copy forward the fields Prom.ua's XLS import
+    requires on every row (Назва_позиції/Опис/Ідентифікатор_товару) so a
+    partial update doesn't blank them. Returns None if no product exists
+    under that numeric id."""
+    response = requests.get(
+        f"{config.PROM_API_BASE_URL}/products/{product_id}",
         headers=_HEADERS,
         timeout=15,
     )

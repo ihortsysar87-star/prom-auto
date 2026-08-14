@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 *.log
 .article_counter
+.olx_synced.json

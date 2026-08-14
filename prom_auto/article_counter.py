@@ -65,6 +65,25 @@ def next_article() -> str:
     return f"v{next_value:04d}"
 
 
+def external_id_for(article: str) -> str:
+    """Prom.ua's Ідентифікатор_товару (external_id) value to pair with
+    `article` (used for Код_товару/sku) - deliberately shaped differently
+    from the plain "vNNNN" pattern, not just equal to it.
+
+    Prom.ua's XLS import matches a row to an existing product by EITHER
+    external_id or sku, whichever holds the given value - and this
+    account's pre-existing catalog already has "vNNNN"-shaped sku values
+    on real, unrelated products. Using plain "vNNNN" as external_id too
+    meant a fresh article could coincidentally equal some old product's
+    sku and silently merge into it - confirmed in practice: an import
+    landed on live products, changing their price to the new item's price
+    while leaving name/description untouched, instead of creating new
+    products. This prefix can never appear in that legacy sku data, so it
+    can't collide with it.
+    """
+    return f"PA-{article}"
+
+
 def _read_counter() -> int:
     if os.path.exists(_COUNTER_FILE):
         with open(_COUNTER_FILE) as f:
