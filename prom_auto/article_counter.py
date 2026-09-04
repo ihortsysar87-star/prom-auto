@@ -1,10 +1,18 @@
+import logging
 import os
 import threading
 
 from . import prom_client
 
+logger = logging.getLogger(__name__)
+
 _COUNTER_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".article_counter")
 _lock = threading.Lock()
+# True once this process has reconciled the local file against Prom.ua's
+# live catalog at least once. Checked/set inside _lock together with the
+# reconciliation itself, so concurrent next_article() calls at process
+# startup can't both decide reconciliation is still needed.
+_reconciled = False
 
 
 def next_article() -> str:
@@ -18,9 +26,40 @@ def next_article() -> str:
     import silently overwrites the first instead of creating a second
     product (confirmed: rapid test imports today all collided into one
     product). A local, synchronous counter can't race with anything.
+
+    The local file itself can still fall behind the live catalog between
+    process runs - e.g. two bot instances ever running against the same
+    Prom.ua account each keep their own local file, or the file gets
+    reset/restored stale. When that happens, a "fresh" local article
+    number can collide with one already used by an unrelated existing
+    product, and Prom.ua's merge-on-import silently overwrites that
+    unrelated product instead of creating a new one - confirmed in
+    practice (local counter found 72 articles behind the live catalog,
+    meaning every import in between was quietly overwriting older,
+    unrelated products rather than creating new ones). Reconciling once
+    against the live max at process startup (not the per-import network
+    round trip find_max_article_number() was originally removed to avoid)
+    catches that drift while still letting a whole session's rapid-fire
+    imports run off the fast local counter afterward.
     """
+    global _reconciled
     with _lock:
         current = _read_counter()
+        if not _reconciled:
+            _reconciled = True
+            try:
+                live_max = prom_client.find_max_article_number()
+            except Exception:
+                logger.exception("Could not reconcile article counter against Prom.ua's live catalog")
+            else:
+                if live_max > current:
+                    logger.warning(
+                        "Local article counter (%d) was behind Prom.ua's live catalog (%d) - "
+                        "resyncing to avoid colliding with existing products",
+                        current,
+                        live_max,
+                    )
+                    current = live_max
         next_value = current + 1
         _write_counter(next_value)
     return f"v{next_value:04d}"

@@ -11,7 +11,12 @@ from . import config, image_host, openai_client, page_fetch, product_image_scrap
 
 logger = logging.getLogger(__name__)
 
-PAGE_TEXT_MAX_CHARS = 6000
+# Generous cap on visible page text sent to the model - just a safety net
+# against pathological pages, not a budget. A tight cap here silently cuts
+# the product description before the model ever sees the rest of it, since
+# _visible_text() also picks up unrelated page chrome (menus, breadcrumbs,
+# related-products blocks) ahead of the actual description in DOM order.
+PAGE_TEXT_MAX_CHARS = 20000
 
 # Every link-mode product is auto-priced 5% below its confirmed source
 # price, so the shop is reliably cheaper than the page it was sourced from.
