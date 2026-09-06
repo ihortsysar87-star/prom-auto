@@ -430,6 +430,68 @@ def extract_json(response):
     return json.loads(text)
 
 
+_TRANSLATE_DESCRIPTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "description": {"type": "string"},
+        "description_ru": {"type": "string"},
+    },
+    "required": ["description", "description_ru"],
+    "additionalProperties": False,
+}
+
+_TRANSLATE_DESCRIPTION_PROMPT = """Тобі надано опис товару ДОСЛІВНО так, як його написав продавець на сторінці-джерелі (мова оригіналу може бути будь-якою - українською, російською, англійською тощо).
+
+Зроби ДВІ паралельні версії цього самого опису:
+- "description" - українською мовою.
+- "description_ru" - російською мовою.
+
+ПРАВИЛА:
+1. Це ПЕРЕКЛАД, а не переказ чи новий опис - збережи максимум інформації з оригіналу: усі факти, характеристики, деталі, структуру та обсяг тексту. Нічого не скорочуй, не узагальнюй і не викидай.
+2. Нічого не додавай від себе - жодних нових характеристик, маркетингових фраз чи речень, яких немає в оригіналі.
+3. Обидві версії ("description" і "description_ru") мають містити РІВНО ту саму інформацію - це один і той самий текст двома мовами, лише мова відрізняється.
+4. Якщо оригінал вже українською - постав його майже без змін у "description" (виправ лише явні помилки), і зроби природний, грамотний російський переклад для "description_ru". Якщо оригінал вже російською - навпаки. Якщо оригінал іншою мовою - природно переклади на обидві мови.
+5. Переклад має звучати природно для носія мови, а не бути буквальним підрядником слово-в-слово.
+
+Поверни ВИКЛЮЧНО один JSON-об'єкт без пояснень, Markdown чи додаткового тексту."""
+
+
+def translate_description(raw_description: str) -> dict:
+    """Translates a description scraped verbatim from a source page into
+    matched Ukrainian/Russian versions, for link-mode products where the
+    merchant's own description (see product_data_extractor._extract_raw_description)
+    is used instead of an AI-generated one.
+
+    Unlike extract_product_from_page's "description"/"description_ru" (which
+    are independently generated from truncated visible page text and can
+    diverge in content), this is a literal translation of the exact same
+    source text into both languages, so the two fields stay content-identical
+    and keep the source's full level of detail.
+    """
+    response = _client.responses.create(
+        model=config.OPENAI_MODEL,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": _TRANSLATE_DESCRIPTION_PROMPT},
+                    {"type": "input_text", "text": raw_description},
+                ],
+            }
+        ],
+        max_output_tokens=2000,
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "translated_description",
+                "schema": _TRANSLATE_DESCRIPTION_SCHEMA,
+                "strict": True,
+            }
+        },
+    )
+    return extract_json(response)
+
+
 _URL_EXTRACT_SCHEMA = {
     "type": "object",
     "properties": {

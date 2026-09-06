@@ -102,6 +102,45 @@ def _json_ld_images(json_ld: dict) -> list[str]:
     return []
 
 
+def _extract_raw_description(html: str, is_html: bool, json_ld: dict | None) -> str | None:
+    """Extracts the product description verbatim from the source page.
+
+    Priority order:
+    1. JSON-LD schema.org Product `description` field (most reliable, already structured).
+    2. Common HTML description container elements (product detail pages).
+    3. Falls back to None — caller will then use the OpenAI-generated description.
+    """
+    # 1. JSON-LD description — exact as the merchant wrote it
+    if json_ld:
+        raw = json_ld.get("description")
+        if raw and isinstance(raw, str) and raw.strip():
+            return raw.strip()
+
+    if not is_html:
+        return None
+
+    # 2. HTML — common description containers used by the sites in scope
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Epicentr / many UA shops
+    for selector in (
+        {"class_": "product-description"},
+        {"itemprop": "description"},
+        {"id": "description"},
+        {"class_": "description-content"},
+        {"class_": "product-detail-description"},
+        {"class_": "product__description"},
+        {"class_": "tab-content-description"},
+    ):
+        el = soup.find(attrs=selector)
+        if el:
+            text = el.get_text(separator="\n").strip()
+            if len(text) > 30:
+                return text
+
+    return None
+
+
 def _gather_image_urls(url: str, json_ld: dict | None) -> list[str]:
     try:
         urls = product_image_scraper.find_product_image_urls(url)
@@ -191,6 +230,14 @@ def identify_product_from_html(
         json_ld = _extract_json_ld_product(html) if is_html else None
     page_text = _visible_text(html) if is_html else html[:PAGE_TEXT_MAX_CHARS]
 
+    # Extract the raw description verbatim from the source page before OpenAI
+    # touches it, so the listing preserves the merchant's original wording.
+    raw_description = _extract_raw_description(html, is_html, json_ld)
+    if raw_description:
+        logger.info("Using verbatim raw description from source page (%d chars)", len(raw_description))
+    else:
+        logger.info("No raw description found on page, will use OpenAI-generated description")
+
     enriched = openai_client.extract_product_from_page(url, json_ld, page_text)
     if enriched.get("error"):
         raise ProductNotFoundError(enriched["error"])
@@ -205,6 +252,27 @@ def identify_product_from_html(
         source_price_uah = round(convert_to_uah(amount, currency), 2)
     else:
         source_price_uah = 0
+
+    # When the source page had its own description, translate that exact
+    # text into matched UA/RU versions instead of using OpenAI's independent
+    # description/description_ru (generated from truncated visible page
+    # text) - that guaranteed the two languages carried different amounts of
+    # info from each other and from the source. Translating the same raw
+    # text keeps both languages content-identical and preserves the
+    # source's full detail; only pages without an extractable description
+    # fall back to OpenAI's generated pair.
+    if raw_description:
+        try:
+            translated = openai_client.translate_description(raw_description)
+            description = translated.get("description") or raw_description
+            description_ru = translated.get("description_ru")
+        except Exception:
+            logger.exception("Description translation failed, falling back to verbatim source text")
+            description = raw_description
+            description_ru = enriched.get("description_ru")
+    else:
+        description = enriched.get("description")
+        description_ru = enriched.get("description_ru")
 
     data = {
         "name": enriched.get("name"),
@@ -221,8 +289,8 @@ def identify_product_from_html(
         "height": enriched.get("height"),
         "length": enriched.get("length"),
         "weight": enriched.get("weight"),
-        "description": enriched.get("description"),
-        "description_ru": enriched.get("description_ru"),
+        "description": description,
+        "description_ru": description_ru,
         "priceUAH": source_price_uah,
         "price_found": price_found,
         "keywords": enriched.get("keywords") or [],

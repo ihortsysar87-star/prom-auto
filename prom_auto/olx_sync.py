@@ -52,9 +52,21 @@ def main() -> None:
         "--limit", type=int, default=None, help="Stop after this many NEW products (for testing)"
     )
     parser.add_argument(
+        "--from-article",
+        default=None,
+        help="Only sync products whose article ('vNNNN') is >= this, e.g. v0554",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="Build and print advert payloads without calling OLX"
     )
     args = parser.parse_args()
+
+    threshold = None
+    if args.from_article:
+        match = prom_client._ARTICLE_PATTERN.match(args.from_article)
+        if not match:
+            parser.error(f"--from-article must look like 'v0554', got {args.from_article!r}")
+        threshold = int(match.group(1))
 
     state = _load_state()
     created = limited = skipped = failed = processed = 0
@@ -62,6 +74,11 @@ def main() -> None:
     for product in prom_client.list_products():
         external_id = product.get("external_id") or product.get("sku") or str(product["id"])
         name = product.get("name", "")
+
+        if threshold is not None:
+            article_match = prom_client._ARTICLE_PATTERN.match(str(external_id))
+            if not article_match or int(article_match.group(1)) < threshold:
+                continue
 
         if external_id in state:
             skipped += 1
