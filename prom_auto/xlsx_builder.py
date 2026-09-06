@@ -1,6 +1,7 @@
 import io
 
 from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
 # Prom.ua represents each product characteristic as a block of 3 columns
 # rather than a single column - "Назва_Характеристики" (name),
@@ -19,6 +20,16 @@ _CHARACTERISTIC_HEADERS = (
 )
 
 
+def _sanitize(value):
+    """Strips XML-illegal control characters (e.g. stray \\x0b/\\x0c from a
+    scraped source page) that openpyxl otherwise rejects outright with
+    IllegalCharacterError, failing the whole batch's xlsx build over a
+    single bad character deep in one product's description."""
+    if isinstance(value, str):
+        return ILLEGAL_CHARACTERS_RE.sub("", value)
+    return value
+
+
 def build_xlsx(products: list[dict]) -> bytes:
     """Equivalent of the n8n 'Convert to File' node (xlsx operation)."""
     wb = Workbook()
@@ -35,12 +46,12 @@ def build_xlsx(products: list[dict]) -> bytes:
     ws.append(headers)
 
     for product in products:
-        row = [product.get(h, "") for h in base_headers]
+        row = [_sanitize(product.get(h, "")) for h in base_headers]
         characteristics = product.get(CHARACTERISTICS_KEY) or []
         for index in range(max_characteristics):
             if index < len(characteristics):
                 name, unit, value = characteristics[index]
-                row.extend([name, unit or "", value])
+                row.extend([_sanitize(name), _sanitize(unit or ""), _sanitize(value)])
             else:
                 row.extend(["", "", ""])
         ws.append(row)
