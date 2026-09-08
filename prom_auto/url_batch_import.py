@@ -16,11 +16,15 @@ Usage:
 
 urls.json: a JSON array of either a plain URL string, or an object:
 {"url": ..., "price": 430} to override that item's price (UAH) instead of
-using the source page's price, and/or {"url": ..., "prefetched": {"page_text":
-..., "json_ld": {...} | null, "image_urls": [...]}} for a page fetched by
-some other means (e.g. a real browser session, for a site whose Cloudflare
-challenge blocks both this tool's direct fetch and its reader-proxy
-fallback) instead of this tool fetching the URL itself.
+using the source page's price, {"url": ..., "description": "..."} to
+override the listing's description instead of the one scraped/generated from
+the source page (given verbatim in one language - translated into the
+matched UA/RU pair the same way a scraped raw description is, see
+product_data_extractor.identify_product_from_html), and/or {"url": ...,
+"prefetched": {"page_text": ..., "json_ld": {...} | null, "image_urls":
+[...]}} for a page fetched by some other means (e.g. a real browser session,
+for a site whose Cloudflare challenge blocks both this tool's direct fetch
+and its reader-proxy fallback) instead of this tool fetching the URL itself.
 """
 from __future__ import annotations
 
@@ -31,7 +35,7 @@ import json
 import logging
 import time
 
-from . import config, product_data_extractor, product_mapper, prom_client, xlsx_builder
+from . import config, openai_client, product_data_extractor, product_mapper, prom_client, xlsx_builder
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -47,25 +51,27 @@ def _one_month_from(d: datetime.date) -> datetime.date:
     return d.replace(year=year, month=month, day=min(d.day, last_day))
 
 
-def load_entries(path: str) -> list[tuple[str, float | None, dict | None]]:
+def load_entries(path: str) -> list[tuple[str, float | None, dict | None, str | None]]:
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
     entries = []
     for item in raw:
         if isinstance(item, str):
-            entries.append((item, None, None))
+            entries.append((item, None, None, None))
         else:
-            entries.append((item["url"], item.get("price"), item.get("prefetched")))
+            entries.append(
+                (item["url"], item.get("price"), item.get("prefetched"), item.get("description"))
+            )
     return entries
 
 
 def build_products(
-    entries: list[tuple[str, float | None, dict | None]]
+    entries: list[tuple[str, float | None, dict | None, str | None]]
 ) -> tuple[list[dict], list[tuple[list[str], dict]]]:
     products: list[dict] = []
     data_list: list[tuple[list[str], dict]] = []
 
-    for i, (url, manual_price, prefetched) in enumerate(entries, start=1):
+    for i, (url, manual_price, prefetched, manual_description) in enumerate(entries, start=1):
         tag = f"[{i}/{len(entries)}]"
         logger.info("%s Fetching %s", tag, url)
         try:
@@ -93,6 +99,16 @@ def build_products(
         elif not data.get("price_found"):
             logger.error("%s No price found on page and no --price override given, skipping: %s", tag, url)
             continue
+
+        if manual_description:
+            try:
+                translated = openai_client.translate_description(manual_description)
+                data["description"] = translated.get("description") or manual_description
+                data["description_ru"] = translated.get("description_ru")
+            except Exception:
+                logger.exception("%s Description override translation failed, using verbatim text for both languages", tag)
+                data["description"] = manual_description
+                data["description_ru"] = manual_description
 
         if not image_urls:
             logger.warning("%s No images found - listing will have none", tag)
