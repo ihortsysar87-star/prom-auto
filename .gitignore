@@ -5,3 +5,5 @@ __pycache__/
 *.log
 .article_counter
 .olx_synced.json
+.olx_synced_*.json
+.DS_Store
