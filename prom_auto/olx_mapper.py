@@ -155,7 +155,9 @@ def build_olx_advert_from_prom_product(product: dict) -> dict:
         "description": description,
         "category_id": category_id,
         "advertiser_type": config.OLX_ADVERTISER_TYPE,
-        "external_id": product.get("external_id") or product.get("sku") or str(product["id"]),
+        # sku first, not external_id - see olx_sync.py's matching comment:
+        # Prom's external_id has drifted from sku for most of the catalog.
+        "external_id": product.get("sku") or product.get("external_id") or str(product["id"]),
         "contact": {
             "name": config.OLX_CONTACT_NAME,
             "phone": config.OLX_CONTACT_PHONE,

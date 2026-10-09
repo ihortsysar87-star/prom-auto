@@ -16,7 +16,10 @@ adverts. This script drives that one-time login:
    refresh_token, and writes OLX_REFRESH_TOKEN into .env.
 
 Usage:
-    python -m prom_auto.olx_auth_setup https://<your-tunnel-host>/oauth/callback
+    python -m prom_auto.olx_auth_setup [--account 2] https://<your-tunnel-host>/oauth/callback
+
+With --account N the token is saved as OLXN_REFRESH_TOKEN (log in as the second
+seller account; OLXN_CLIENT_ID/SECRET fall back to the primary app's if unset).
 """
 from __future__ import annotations
 
@@ -66,13 +69,17 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    args = sys.argv[1:]
+    if len(args) == 3 and args[0] == "--account":
+        config.use_olx_account(args[1])
+        args = args[2:]
+    if len(args) != 1:
+        print("Usage: python -m prom_auto.olx_auth_setup [--account N] <redirect_uri registered in OLX App Manager>")
+        sys.exit(1)
+    redirect_uri = args[0]
     if not config.OLX_CLIENT_ID or not config.OLX_CLIENT_SECRET:
         print("Set OLX_CLIENT_ID and OLX_CLIENT_SECRET in .env before running this.")
         sys.exit(1)
-    if len(sys.argv) != 2:
-        print(f"Usage: python -m prom_auto.olx_auth_setup <redirect_uri registered in OLX App Manager>")
-        sys.exit(1)
-    redirect_uri = sys.argv[1]
 
     state = secrets.token_urlsafe(16)
     authorize_url = _build_authorize_url(redirect_uri, state)
@@ -114,7 +121,7 @@ def main() -> None:
     )
     who = me.json().get("name", "?") if me.ok else "(couldn't confirm - see below)"
 
-    print(f"\nDone. OLX_REFRESH_TOKEN saved to .env. Logged in as: {who}")
+    print(f"\nDone. {config.OLX_REFRESH_TOKEN_ENV} saved to .env. Logged in as: {who}")
     print("The bot will refresh the access token automatically from now on - no need to run this again")
     print("unless the refresh token is left unused for 30 days.")
 

@@ -10,7 +10,10 @@ quota for its category is used up), it's left inactive as-is - no packet is
 purchased and no activate command is sent.
 
 Usage:
-    python -m prom_auto.olx_sync [--limit N] [--dry-run]
+    python -m prom_auto.olx_sync [--account 2] [--limit N] [--dry-run]
+
+--account N posts to the secondary OLX account configured via OLXN_* vars in
+.env (see config.use_olx_account); state goes to .olx_synced_N.json.
 """
 from __future__ import annotations
 
@@ -19,19 +22,27 @@ import json
 import logging
 from pathlib import Path
 
-from . import olx_client, olx_mapper, prom_client
+from . import config, olx_client, olx_mapper, prom_client
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-_STATE_PATH = Path(__file__).resolve().parent.parent / ".olx_synced.json"
+_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _state_path() -> Path:
+    """Each OLX account tracks its own synced products - a product already
+    posted on the primary account still has to go up on the second one."""
+    suffix = f"_{config.OLX_ACCOUNT}" if config.OLX_ACCOUNT else ""
+    return _ROOT / f".olx_synced{suffix}.json"
 
 
 def _load_state() -> dict:
-    if _STATE_PATH.exists():
-        return json.loads(_STATE_PATH.read_text())
+    path = _state_path()
+    if path.exists():
+        return json.loads(path.read_text())
     return {}
 
 
@@ -43,11 +54,14 @@ def _record_synced(external_id: str, entry: dict) -> None:
     entries added by another concurrently-running process before."""
     on_disk = _load_state()
     on_disk[external_id] = entry
-    _STATE_PATH.write_text(json.dumps(on_disk, ensure_ascii=False, indent=2))
+    _state_path().write_text(json.dumps(on_disk, ensure_ascii=False, indent=2))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--account", default=None, help="Secondary OLX account suffix, e.g. 2 (reads OLX2_* from .env)"
+    )
     parser.add_argument(
         "--limit", type=int, default=None, help="Stop after this many NEW products (for testing)"
     )
@@ -60,6 +74,8 @@ def main() -> None:
         "--dry-run", action="store_true", help="Build and print advert payloads without calling OLX"
     )
     args = parser.parse_args()
+    if args.account:
+        config.use_olx_account(args.account)
 
     threshold = None
     if args.from_article:
@@ -72,7 +88,16 @@ def main() -> None:
     created = limited = skipped = failed = processed = 0
 
     for product in prom_client.list_products():
-        external_id = product.get("external_id") or product.get("sku") or str(product["id"])
+        # sku ("Код_товару", the human "vNNNN" article) takes priority over
+        # Prom's own external_id field: article_counter.py's local counter
+        # has drifted from sku for most of the catalog (confirmed live -
+        # 359/754 products have external_id="PA-v10NN" while sku is an
+        # unrelated, lower "v0NNN"), so external_id-first silently excluded
+        # most products from --from-article matching and .olx_synced.json's
+        # dedup key. sku is what's shown in Prom's own xlsx export/UI and
+        # what's actually used to refer to a product, so it's the one that
+        # should drive both.
+        external_id = product.get("sku") or product.get("external_id") or str(product["id"])
         name = product.get("name", "")
 
         if threshold is not None:

@@ -46,9 +46,10 @@ def _persist_refresh_token(new_refresh_token: str) -> None:
         return
 
     text = _ENV_PATH.read_text()
-    new_line = f"OLX_REFRESH_TOKEN={new_refresh_token}"
-    if re.search(r"^OLX_REFRESH_TOKEN=.*$", text, flags=re.MULTILINE):
-        text = re.sub(r"^OLX_REFRESH_TOKEN=.*$", new_line, text, count=1, flags=re.MULTILINE)
+    key = re.escape(config.OLX_REFRESH_TOKEN_ENV)
+    new_line = f"{config.OLX_REFRESH_TOKEN_ENV}={new_refresh_token}"
+    if re.search(rf"^{key}=.*$", text, flags=re.MULTILINE):
+        text = re.sub(rf"^{key}=.*$", lambda _: new_line, text, count=1, flags=re.MULTILINE)
     else:
         text = text.rstrip("\n") + f"\n{new_line}\n"
     _ENV_PATH.write_text(text)
@@ -85,7 +86,8 @@ def _refresh_access_token() -> str:
 
     if not config.OLX_REFRESH_TOKEN:
         raise OlxAuthError(
-            "No OLX_REFRESH_TOKEN configured - run `python -m prom_auto.olx_auth_setup` once to log in."
+            f"No {config.OLX_REFRESH_TOKEN_ENV} configured - run `python -m prom_auto.olx_auth_setup` "
+            "(with --account N for a secondary account) once to log in."
         )
 
     tokens = _request_token(

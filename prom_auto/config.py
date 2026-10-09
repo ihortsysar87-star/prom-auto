@@ -37,6 +37,46 @@ OLX_CONTACT_PHONE = os.environ.get("OLX_CONTACT_PHONE", "")
 OLX_CITY_ID = os.environ.get("OLX_CITY_ID", "")
 OLX_DISTRICT_ID = os.environ.get("OLX_DISTRICT_ID", "")
 OLX_CONDITION = os.environ.get("OLX_CONDITION", "new")
+# Which .env variable OLX_REFRESH_TOKEN lives in (olx_client rewrites it when
+# OLX rotates the token) and which account's state file olx_sync uses.
+OLX_REFRESH_TOKEN_ENV = "OLX_REFRESH_TOKEN"
+OLX_ACCOUNT = ""
+
+
+def use_olx_account(account: str) -> None:
+    """Switches the OLX_* settings above to a secondary OLX seller account.
+
+    Account "2" reads OLX2_CLIENT_ID, OLX2_REFRESH_TOKEN, OLX2_CONTACT_NAME,
+    etc. from .env; any OLX2_* variable that isn't set falls back to the
+    primary account's OLX_* value (so e.g. the same OLX app credentials or
+    city can be shared). An empty account keeps the primary one. Call before
+    any olx_client/olx_mapper use - one process works with one account."""
+    global OLX_CLIENT_ID, OLX_CLIENT_SECRET, OLX_REFRESH_TOKEN, OLX_ADVERTISER_TYPE
+    global OLX_CONTACT_NAME, OLX_CONTACT_PHONE, OLX_CITY_ID, OLX_DISTRICT_ID, OLX_CONDITION
+    global OLX_REFRESH_TOKEN_ENV, OLX_ACCOUNT
+    if not account:
+        return
+    prefix = f"OLX{account}_"
+
+    def pick(name: str, primary: str) -> str:
+        return os.environ.get(prefix + name, primary)
+
+    OLX_CLIENT_ID = pick("CLIENT_ID", OLX_CLIENT_ID)
+    OLX_CLIENT_SECRET = pick("CLIENT_SECRET", OLX_CLIENT_SECRET)
+    # Never inherit the primary refresh token - that would act as the wrong user.
+    OLX_REFRESH_TOKEN = os.environ.get(prefix + "REFRESH_TOKEN", "")
+    OLX_ADVERTISER_TYPE = pick("ADVERTISER_TYPE", OLX_ADVERTISER_TYPE)
+    OLX_CONTACT_NAME = pick("CONTACT_NAME", OLX_CONTACT_NAME)
+    OLX_CONTACT_PHONE = pick("CONTACT_PHONE", OLX_CONTACT_PHONE)
+    OLX_CITY_ID = pick("CITY_ID", OLX_CITY_ID)
+    OLX_DISTRICT_ID = pick("DISTRICT_ID", OLX_DISTRICT_ID)
+    OLX_CONDITION = pick("CONDITION", OLX_CONDITION)
+    OLX_REFRESH_TOKEN_ENV = prefix + "REFRESH_TOKEN"
+    OLX_ACCOUNT = account
+
+
+# `OLX_ACCOUNT=2 python -m prom_auto.olx_sync` is equivalent to `--account 2`.
+use_olx_account(os.environ.get("OLX_ACCOUNT", ""))
 
 # Rozetka's own feed-validation report (seller.rozetka.com.ua) - not a Prom.ua
 # or Rozetka API, just the hash tied to your account's validation page, used
