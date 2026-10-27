@@ -57,6 +57,31 @@ python -m prom_auto.olx_sync            # push everything not yet synced
 python -m prom_auto.olx_sync --dry-run   # print payloads without posting
 ```
 
+## Photo hosting: do not use imgbb
+
+Do **not** use imgbb (`image_host.py`, `IMGBB_API_KEY`) to host photos for Prom.ua
+imports. Its API rate-limits aggressively (HTTP 400 "Rate limit reached"), and once
+tripped it stayed blocked for well over an hour, stalling a whole import.
+
+Host photos on our Hetzner server instead (the same box as the zakupkaok shop;
+connection details are in `../zakupkaok/deploy/README.md`):
+
+```
+scp photo.jpg zakupkaok@2.28.119.71:/srv/zakupkaok/uploads/prom/<name>.jpg
+# served at https://zakupkaok.com.ua/uploads/prom/<name>.jpg
+```
+
+- Use the `uploads/prom/` subfolder so these files stay apart from the shop's own
+  uploads, and use unique file names.
+- The URL only works because Caddy serves `/uploads/*` straight from disk (the
+  `handle /uploads/*` block in zakupkaok's `deploy/Caddyfile`, installed to
+  `/etc/caddy/Caddyfile`; that needs root, the `zakupkaok` user's sudo only allows
+  restarting the app).
+- HEIC photos from a phone must be converted first, e.g.
+  `sips -Z 1600 -s format jpeg IMG.HEIC --out IMG.jpg`.
+- Check each URL returns 200 before importing, since Prom.ua fetches images
+  asynchronously and silently drops any it cannot load.
+
 ## Layout
 
 - `prom_auto/config.py` — env-based settings
@@ -66,6 +91,7 @@ python -m prom_auto.olx_sync --dry-run   # print payloads without posting
 - `prom_auto/page_fetch.py` — page fetching, with a reader-proxy fallback for bot-protected sites
 - `prom_auto/product_mapper.py` — maps identified product data to Prom.ua's import columns
 - `prom_auto/xlsx_builder.py` — builds the Prom.ua import xlsx
+- `prom_auto/image_host.py` — imgbb photo hosting, **deprecated, do not use** (see Photo hosting above)
 - `prom_auto/prom_client.py` — Prom.ua API (import_file, list_products)
 - `prom_auto/olx_client.py` — OLX API (OAuth token refresh, adverts, categories, cities)
 - `prom_auto/olx_mapper.py` — maps a Prom.ua product to OLX's advert payload

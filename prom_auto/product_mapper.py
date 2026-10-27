@@ -1,6 +1,26 @@
+from __future__ import annotations
+
+import re
+
 from . import article_counter, config, xlsx_builder
 
 _CHARACTERISTIC_UNITS = {"Ширина": "см", "Висота": "см", "Довжина": "см", "Вага": "кг"}
+
+
+def _name_with_brand(name: str | None, brand: str | None) -> str:
+    """Name with the brand appended exactly once, at the end.
+
+    The model often already includes the brand inside the name, so blindly
+    appending it printed the brand twice. Any existing occurrence is removed
+    first, then the brand is added at the end.
+    """
+    name = (name or "").strip()
+    brand = (brand or "").strip()
+    if not brand or brand == "null":
+        return name
+    stripped = re.sub(rf"(?<!\w){re.escape(brand)}(?!\w)", " ", name, flags=re.IGNORECASE)
+    stripped = " ".join(stripped.split())
+    return f"{stripped} {brand}".strip()
 
 
 def build_characteristics(data: dict) -> list[tuple[str, str, object]]:
@@ -49,7 +69,7 @@ def build_prom_product(data: dict, image_url: str) -> dict:
     # into one unbroken line. <br> is required for an actual visible break.
     specifications = "".join(f"- {label}: {value};<br>" for label, unit, value in characteristics)
     description = f"{data.get('description', '')}<br><br>Характеристики:<br>{specifications}"
-    name = " ".join(part for part in (data.get("name"), data.get("brand")) if part).strip()
+    name = _name_with_brand(data.get("name"), data.get("brand"))
 
     # "Назва_позиції"/"Опис" are Prom.ua's Russian-language fields (the
     # "_укр" suffix marks the Ukrainian counterpart). They must be real
@@ -77,9 +97,7 @@ def build_prom_product(data: dict, image_url: str) -> dict:
         f"{data.get('description_ru') or data.get('description', '')}<br><br>"
         f"Характеристики:<br>{specifications_ru}"
     )
-    name_ru = " ".join(
-        part for part in (data.get("name_ru") or data.get("name"), data.get("brand")) if part
-    ).strip()
+    name_ru = _name_with_brand(data.get("name_ru") or data.get("name"), data.get("brand"))
 
     return {
         "Ідентифікатор_товару": external_id,
